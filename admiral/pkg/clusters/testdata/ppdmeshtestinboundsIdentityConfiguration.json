@@ -1,0 +1,115 @@
+{
+  "identityName": "ppdmeshtestinbounds",
+  "clusters": {
+    "cluster-usw2-k8s": {
+      "_comment-1": "THIS SECTION CONTAINS CLUSTER LEVEL DETAILS, WHICH ARE THE SAME FOR THE ASSET IN A GIVEN CLUSTER",
+      "name": "cluster-usw2-k8s",
+      "locality": "us-west-2",
+      "ingressEndpoint": "abc-elb.us-west-2.elb.amazonaws.com.",
+      "ingressPort": "15443",
+      "ingressPortName": "http",
+      "_comment-2": "THIS SECTION CONTAINS ENVIRONMENT LEVEL DETAILS, FOR THE ASSET IN A GIVEN CLUSTER",
+      "environment": {
+        "ppd": {
+          "name": "ppd",
+          "namespace": "services-inboundd268-usw2-dev",
+          "serviceName": "inbound-root-service",
+          "services": {
+            "inbound-root-service": {
+              "name": "inbound-root-service",
+              "weight": -1,
+              "ports": {
+                "http": 8090
+              }
+            }
+          },
+          "type": "deployment",
+          "selectors": {
+            "app": "inbound-gw"
+          },
+          "ports": [
+            {
+              "name": "http",
+              "number": 80,
+              "protocol": "http"
+            }
+          ],
+          "trafficPolicy": {
+            "clientConnectionConfig": {
+              "metadata": {
+                "name": "sampleCCC",
+                "labels": {
+                  "identity": "ppdmeshtestinbounds"
+                },
+                "annotations": {
+                  "env": "ppd"
+                }
+              },
+              "spec": {
+                "connectionPool": {
+                  "http": {
+                    "http2MaxRequests": 1000,
+                    "maxRequestsPerConnection": 5
+                  }
+                },
+                "tunnel": {}
+              }
+            },
+            "globalTrafficPolicy": {
+              "metadata": {
+                "name": "sampleGTP",
+                "labels": {
+                  "identity": "ppdmeshtestinbounds"
+                },
+                "annotations": {
+                  "env": "ppd"
+                }
+              },
+              "spec": {
+                "policy": [
+                  {
+                    "target": [
+                      {
+                        "region": "us-west-2",
+                        "weight": 50
+                      },
+                      {
+                        "region": "us-east-2",
+                        "weight": 50
+                      }
+                    ],
+                    "dnsPrefix": "testDnsPrefix",
+                    "outlier_detection": {
+                      "consecutive_gateway_errors": 5,
+                      "interval": 5
+                    }
+                  }
+                ]
+              }
+            },
+            "outlierDetection": {
+              "metadata": {
+                "name": "sampleOD",
+                "labels": {
+                  "identity": "ppdmeshtestinbounds"
+                },
+                "annotations": {
+                  "env": "ppd"
+                }
+              },
+              "spec": {
+                "outlier_config": {
+                  "consecutive_gateway_errors": 10,
+                  "interval": 10
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "clientAssets": {
+      "ppdmeshtestinbounds": "ppdmeshtestinbounds"
+  }
+}

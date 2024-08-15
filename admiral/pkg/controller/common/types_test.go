@@ -3,10 +3,10 @@ package common
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	"k8s.io/apimachinery/pkg/util/uuid"
 )
@@ -45,40 +45,72 @@ func TestMapOfMaps(t *testing.T) {
 	if map3 != nil {
 		t.Fail()
 	}
+
 }
 
-func TestEgressMap(t *testing.T) {
-	egressMap := NewSidecarEgressMap()
-	payments, orders := "payments", "orders"
-	paymentsEnv, ordersEnv := "prod", "staging"
-	paymentsNs, ordersNs := payments+"-"+paymentsEnv, orders+"-"+ordersEnv
-	paymentsFqdn, ordersFqdn := payments+"."+paymentsNs+"."+"svc.cluster.local", orders+"."+ordersNs+"."+"svc.cluster.local"
-	paymentsCname, ordersCname := paymentsEnv+"."+payments+".global", ordersEnv+"."+orders+".global"
-	paymentsSidecar, ordersSidecar := SidecarEgress{FQDN: paymentsFqdn, Namespace: paymentsNs, CNAMEs: map[string]string{paymentsCname: paymentsCname}}, SidecarEgress{FQDN: ordersFqdn, Namespace: ordersNs, CNAMEs: map[string]string{ordersCname: ordersCname}}
-	egressMap.Put(payments, paymentsNs, paymentsFqdn, map[string]string{paymentsCname: paymentsCname})
-	egressMap.Put(orders, ordersNs, ordersFqdn, map[string]string{ordersCname: ordersCname})
+func TestDeleteMapOfMaps(t *testing.T) {
+	t.Parallel()
+	mapOfMaps := NewMapOfMaps()
+	mapOfMaps.Put("pkey1", "dev.a.global1", "127.0.10.1")
+	mapOfMaps.Put("pkey1", "dev.a.global2", "127.0.10.2")
+	mapOfMaps.DeleteMap("pkey1", "dev.a.global1")
 
-	ordersEgress := egressMap.Get("orders")
+	mapValue := mapOfMaps.Get("pkey1")
+	if len(mapValue.Get("dev.a.global1")) > 0 {
+		t.Errorf("expected=nil, got=%v", mapValue.Get("dev.a.global1"))
+	}
+	if mapValue.Get("dev.a.global2") != "127.0.10.2" {
+		t.Errorf("expected=%v, got=%v", "127.0.10.2", mapValue.Get("dev.a.global2"))
+	}
+}
 
-	if !cmp.Equal(ordersEgress[ordersNs], ordersSidecar) {
-		t.Errorf("Orders egress object should match expected %v, got %v", ordersSidecar, ordersEgress[ordersNs])
-		t.FailNow()
+func TestMapOfMapOfMaps(t *testing.T) {
+	t.Parallel()
+	mapOfMapOfMaps := NewMapOfMapOfMaps()
+	mapOfMapOfMaps.Put("pkey1", "dev.a.global1", "127.0.10.1", "ns1")
+	mapOfMapOfMaps.Put("pkey1", "dev.a.global2", "127.0.10.2", "ns2")
+	mapOfMapOfMaps.Put("pkey2", "qa.a.global", "127.0.10.1", "ns3")
+	mapOfMapOfMaps.Put("pkey2", "qa.a.global", "127.0.10.2", "ns4")
+
+	mapOfMaps1 := mapOfMapOfMaps.Get("pkey1")
+	if mapOfMaps1 == nil || mapOfMaps1.Get("dev.a.global1").Get("127.0.10.1") != "ns1" {
+		t.Fail()
+	}
+	if mapOfMapOfMaps.Len() != 2 {
+		t.Fail()
 	}
 
-	egressMap.Delete(orders)
-	ordersEgress = egressMap.Get("orders")
+	mapOfMaps1.Delete("dev.a.global2")
 
-	if ordersEgress != nil {
-		t.Errorf("Delete object should delete the object %v", ordersEgress)
-		t.FailNow()
+	mapOfMaps2 := mapOfMapOfMaps.Get("pkey1")
+	if mapOfMaps2.Get("dev.a.global2") != nil {
+		t.Fail()
 	}
 
-	egressMapForIter := egressMap.Map()
-
-	if len(egressMapForIter) != 1 {
-		t.Errorf("Egressmap should contains only one object %v", paymentsSidecar)
-		t.FailNow()
+	keyList := mapOfMapOfMaps.Get("pkey2").Get("qa.a.global").GetKeys()
+	if len(keyList) != 2 {
+		t.Fail()
 	}
+
+	mapOfMapOfMaps.Put("pkey3", "prod.a.global", "127.0.10.1", "ns5")
+
+	mapOfMaps3 := mapOfMapOfMaps.Get("pkey3")
+	if mapOfMaps3 == nil || mapOfMaps3.Get("prod.a.global").Get("127.0.10.1") != "ns5" {
+		t.Fail()
+	}
+
+	mapOfMaps4 := mapOfMapOfMaps.Get("pkey4")
+	if mapOfMaps4 != nil {
+		t.Fail()
+	}
+
+	mapOfMaps5 := NewMapOfMaps()
+	mapOfMaps5.Put("dev.b.global", "ns6", "ns6")
+	mapOfMapOfMaps.PutMapofMaps("pkey5", mapOfMaps5)
+	if mapOfMapOfMaps.Get("pkey5") == nil || mapOfMapOfMaps.Get("pkey5").Get("dev.b.global").Get("ns6") != "ns6" {
+		t.Fail()
+	}
+
 }
 
 func TestAdmiralParams(t *testing.T) {
@@ -126,7 +158,7 @@ func TestMapOfMapsRange(t *testing.T) {
 	mapOfMaps.Put("pkey2", "qa.a.global", "127.0.10.1")
 	mapOfMaps.Put("pkey3", "stage.a.global", "127.0.10.1")
 
-	keys := make(map[string]string, len(mapOfMaps.Map()))
+	keys := make(map[string]string, len(mapOfMaps.cache))
 	for _, k := range keys {
 		keys[k] = k
 	}
@@ -185,6 +217,62 @@ func TestMapRange(t *testing.T) {
 	numOfIter := 0
 	m.Range(func(k string, v string) {
 		assert.NotNil(t, keys[k])
+		numOfIter++
+	})
+
+	assert.Equal(t, 3, numOfIter)
+
+}
+
+func TestSidecarEgressGet(t *testing.T) {
+
+	egressMap := NewSidecarEgressMap()
+	egressMap.Put("pkey1", "pkey2", "fqdn", map[string]string{"pkey2": "pkey2"})
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(3*time.Second))
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	// Producer go routine
+	go func(ctx context.Context) {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				egressMap.Put("pkey1", string(uuid.NewUUID()), "fqdn", map[string]string{"pkey2": "pkey2"})
+			}
+		}
+	}(ctx)
+
+	// Consumer go routine
+	go func(ctx context.Context) {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				assert.NotNil(t, egressMap.Get("pkey1"))
+			}
+		}
+	}(ctx)
+
+	wg.Wait()
+}
+
+func TestSidecarEgressRange(t *testing.T) {
+
+	egressMap := NewSidecarEgressMap()
+	egressMap.Put("pkey1", "pkey2", "fqdn", map[string]string{"pkey2": "pkey2"})
+	egressMap.Put("pkey2", "pkey2", "fqdn", map[string]string{"pkey2": "pkey2"})
+	egressMap.Put("pkey3", "pkey2", "fqdn", map[string]string{"pkey2": "pkey2"})
+
+	numOfIter := 0
+	egressMap.Range(func(k string, v map[string]SidecarEgress) {
+		assert.NotNil(t, v)
 		numOfIter++
 	})
 

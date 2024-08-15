@@ -7,7 +7,7 @@ set -o pipefail
 SCRIPT_ROOT=$(realpath $(dirname ${BASH_SOURCE})/..) #brew install coreutils (mac) or sudo apt-get install realpath (linux) if you don't have it
 
 # Grab code-generator version from go.sum.
-CODEGEN_VERSION=$(grep 'k8s.io/code-generator' go.mod | awk '{print $2}' | head -1)
+CODEGEN_VERSION=$(grep 'k8s.io/code-generator' go.mod | awk '{print $4}' | head -1)
 CODEGEN_PKG=$(echo `go env GOPATH`"/pkg/mod/k8s.io/code-generator@${CODEGEN_VERSION}")
 
 echo ">> Using ${CODEGEN_PKG}"
@@ -30,7 +30,7 @@ chmod +x ${CODEGEN_PKG}/generate-groups.sh ##If you get a `no file or directory`
 
 ${CODEGEN_PKG}/generate-groups.sh all \
     github.com/istio-ecosystem/admiral/admiral/pkg/client github.com/istio-ecosystem/admiral/admiral/pkg/apis \
-    "admiral:v1" \
+    "admiral:v1alpha1" \
     --output-base "${TEMP_DIR}" \
     --go-header-file ${SCRIPT_ROOT}/hack/boilerplate.go.txt
 

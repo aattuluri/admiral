@@ -1,8 +1,13 @@
 package istio
 
 import (
+	"context"
 	"fmt"
 	"time"
+
+	"github.com/istio-ecosystem/admiral/admiral/pkg/client/loader"
+	"github.com/istio-ecosystem/admiral/admiral/pkg/controller/common"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/istio-ecosystem/admiral/admiral/pkg/controller/admiral"
 	networking "istio.io/client-go/pkg/apis/networking/v1alpha3"
@@ -13,11 +18,11 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
-// Handler interface contains the methods that are required
+// SidecarHandler interface contains the methods that are required
 type SidecarHandler interface {
-	Added(obj *networking.Sidecar)
-	Updated(obj *networking.Sidecar)
-	Deleted(obj *networking.Sidecar)
+	Added(ctx context.Context, obj *networking.Sidecar) error
+	Updated(ctx context.Context, obj *networking.Sidecar) error
+	Deleted(ctx context.Context, obj *networking.Sidecar) error
 }
 
 type SidecarEntry struct {
@@ -31,14 +36,18 @@ type SidecarController struct {
 	informer       cache.SharedIndexInformer
 }
 
-func NewSidecarController(stopCh <-chan struct{}, handler SidecarHandler, config *rest.Config, resyncPeriod time.Duration) (*SidecarController, error) {
+func (s *SidecarController) DoesGenerationMatch(*log.Entry, interface{}, interface{}) (bool, error) {
+	return false, nil
+}
+
+func NewSidecarController(stopCh <-chan struct{}, handler SidecarHandler, config *rest.Config, resyncPeriod time.Duration, clientLoader loader.ClientLoader) (*SidecarController, error) {
 
 	sidecarController := SidecarController{}
 	sidecarController.SidecarHandler = handler
 
 	var err error
 
-	ic, err := versioned.NewForConfig(config)
+	ic, err := clientLoader.LoadIstioClientFromConfig(config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sidecar controller k8s client: %v", err)
 	}
@@ -47,23 +56,50 @@ func NewSidecarController(stopCh <-chan struct{}, handler SidecarHandler, config
 
 	sidecarController.informer = informers.NewSidecarInformer(ic, k8sV1.NamespaceAll, resyncPeriod, cache.Indexers{})
 
-	admiral.NewController(stopCh, &sidecarController, sidecarController.informer)
+	admiral.NewController("sidecar-ctrl", config.Host, stopCh, &sidecarController, sidecarController.informer)
 
 	return &sidecarController, nil
 }
 
-func (sec *SidecarController) Added(ojb interface{}) {
-	sidecar := ojb.(*networking.Sidecar)
-	sec.SidecarHandler.Added(sidecar)
+func (sec *SidecarController) Added(ctx context.Context, obj interface{}) error {
+	sidecar, ok := obj.(*networking.Sidecar)
+	if !ok {
+		return fmt.Errorf("type assertion failed, %v is not of type *v1alpha3.Sidecar", obj)
+	}
+	return sec.SidecarHandler.Added(ctx, sidecar)
 }
 
-func (sec *SidecarController) Updated(ojb interface{}, oldObj interface{}) {
-	sidecar := ojb.(*networking.Sidecar)
-	sec.SidecarHandler.Updated(sidecar)
+func (sec *SidecarController) Updated(ctx context.Context, obj interface{}, oldObj interface{}) error {
+	sidecar, ok := obj.(*networking.Sidecar)
+	if !ok {
+		return fmt.Errorf("type assertion failed, %v is not of type *v1alpha3.Sidecar", obj)
+	}
+	return sec.SidecarHandler.Updated(ctx, sidecar)
 }
 
-func (sec *SidecarController) Deleted(ojb interface{}) {
-	sidecar := ojb.(*networking.Sidecar)
-	sec.SidecarHandler.Deleted(sidecar)
+func (sec *SidecarController) Deleted(ctx context.Context, obj interface{}) error {
+	sidecar, ok := obj.(*networking.Sidecar)
+	if !ok {
+		return fmt.Errorf("type assertion failed, %v is not of type *v1alpha3.Sidecar", obj)
+	}
+	return sec.SidecarHandler.Deleted(ctx, sidecar)
+}
 
+func (sec *SidecarController) GetProcessItemStatus(obj interface{}) (string, error) {
+	return common.NotProcessed, nil
+}
+
+func (sec *SidecarController) UpdateProcessItemStatus(obj interface{}, status string) error {
+	return nil
+}
+
+func (sec *SidecarController) LogValueOfAdmiralIoIgnore(obj interface{}) {
+}
+
+func (sec *SidecarController) Get(ctx context.Context, isRetry bool, obj interface{}) (interface{}, error) {
+	/*sidecar, ok := obj.(*networking.Sidecar)
+	if ok && sec.IstioClient != nil {
+		return sec.IstioClient.NetworkingV1alpha3().Sidecars(sidecar.Namespace).Get(ctx, sidecar.Name, meta_v1.GetOptions{})
+	}*/
+	return nil, fmt.Errorf("istio client is not initialized, txId=%s", ctx.Value("txId"))
 }

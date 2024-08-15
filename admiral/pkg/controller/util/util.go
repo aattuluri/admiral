@@ -2,6 +2,10 @@ package util
 
 import (
 	"reflect"
+	"time"
+
+	"github.com/istio-ecosystem/admiral/admiral/pkg/controller/common"
+	log "github.com/sirupsen/logrus"
 )
 
 func MapCopy(dst, src interface{}) {
@@ -35,4 +39,36 @@ func Contains(vs []string, t string) bool {
 		}
 	}
 	return false
+}
+
+func LogElapsedTime(op, identity, env, clusterId string) func() {
+	start := time.Now()
+	return func() {
+		LogElapsedTimeSince(op, identity, env, clusterId, start)
+	}
+}
+
+func LogElapsedTimeController(logger *log.Entry, logMessage string) func() {
+	start := time.Now()
+	return func() {
+		logger.Infof("%s txTime=%v",
+			logMessage,
+			time.Since(start).Milliseconds())
+	}
+}
+
+func LogElapsedTimeForTask(logger *log.Entry, op, name, namespace, cluster, message string) func() {
+	start := time.Now()
+	return func() {
+		LogElapsedTimeSinceTask(logger, op, name, namespace, cluster, message, start)
+	}
+}
+
+func LogElapsedTimeSinceTask(logger *log.Entry, task, name, namespace, cluster, message string, start time.Time) {
+	// task=%v name=%v namespace=%s cluster=%s message=%v txId=%v
+	logger.Infof(common.CtxLogFormatWithTime, task, name, namespace, cluster, message, time.Since(start).Milliseconds())
+}
+
+func LogElapsedTimeSince(op, identity, env, clusterId string, start time.Time) {
+	log.Infof("op=%s identity=%s env=%s cluster=%s txTime=%v", op, identity, env, clusterId, time.Since(start).Milliseconds())
 }

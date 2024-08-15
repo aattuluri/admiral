@@ -13,6 +13,10 @@ spec:
       app: admiral
   template:
     metadata:
+      annotations:
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "6900"
+        prometheus.io/scrape: "true"
       labels:
         app: admiral
     spec:
@@ -29,6 +33,9 @@ spec:
             - 20s
             - --gateway_app
             - istio-eastwestgateway
+            - --envoy_filter_version
+            - "1.13"
+            - --enable_routing_policy=true
           image: docker.io/admiralproj/admiral:latest
           imagePullPolicy: Always
           livenessProbe:
@@ -50,6 +57,8 @@ spec:
           ports:
             - containerPort: 8080
               name: service
+            - containerPort: 6900
+              name: metrics
           resources:
             limits:
               cpu: 1

@@ -18,11 +18,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
+
 	"github.com/istio-ecosystem/admiral/admiral/pkg/controller/common"
 	"github.com/istio-ecosystem/admiral/admiral/pkg/controller/secret/resolver"
+	"github.com/istio-ecosystem/admiral/admiral/pkg/registry"
+	"github.com/istio-ecosystem/admiral/admiral/pkg/util"
 	log "github.com/sirupsen/logrus"
 	"k8s.io/client-go/rest"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,26 +48,29 @@ const (
 // DO NOT USE - TEST ONLY.
 var LoadKubeConfig = clientcmd.Load
 
+var remoteClustersMetric common.Gauge
+
 // addSecretCallback prototype for the add secret callback function.
-type addSecretCallback func(config *rest.Config, dataKey string, resyncPeriod time.Duration) error
+type addSecretCallback func(config *rest.Config, dataKey string, resyncPeriod util.ResyncIntervals) error
 
 // updateSecretCallback prototype for the update secret callback function.
-type updateSecretCallback func(config *rest.Config, dataKey string, resyncPeriod time.Duration) error
+type updateSecretCallback func(config *rest.Config, dataKey string, resyncPeriod util.ResyncIntervals) error
 
 // removeSecretCallback prototype for the remove secret callback function.
 type removeSecretCallback func(dataKey string) error
 
 // Controller is the controller implementation for Secret resources
 type Controller struct {
-	kubeclientset  kubernetes.Interface
-	namespace      string
-	Cs             *ClusterStore
-	queue          workqueue.RateLimitingInterface
-	informer       cache.SharedIndexInformer
-	addCallback    addSecretCallback
-	updateCallback updateSecretCallback
-	removeCallback removeSecretCallback
-	secretResolver resolver.SecretResolver
+	kubeclientset            kubernetes.Interface
+	namespace                string
+	Cs                       *ClusterStore
+	queue                    workqueue.RateLimitingInterface
+	informer                 cache.SharedIndexInformer
+	addCallback              addSecretCallback
+	updateCallback           updateSecretCallback
+	removeCallback           removeSecretCallback
+	secretResolver           resolver.SecretResolver
+	clusterShardStoreHandler registry.ClusterShardStore
 }
 
 // RemoteCluster defines cluster structZZ
@@ -93,17 +99,19 @@ func NewController(
 	addCallback addSecretCallback,
 	updateCallback updateSecretCallback,
 	removeCallback removeSecretCallback,
+	admiralProfile string,
 	secretResolverType string) *Controller {
 
+	ctx := context.Background()
 	secretsInformer := cache.NewSharedIndexInformer(
 		&cache.ListWatch{
 			ListFunc: func(opts meta_v1.ListOptions) (runtime.Object, error) {
 				opts.LabelSelector = filterLabel + "=true"
-				return kubeclientset.CoreV1().Secrets(namespace).List(opts)
+				return kubeclientset.CoreV1().Secrets(namespace).List(ctx, opts)
 			},
 			WatchFunc: func(opts meta_v1.ListOptions) (watch.Interface, error) {
 				opts.LabelSelector = filterLabel + "=true"
-				return kubeclientset.CoreV1().Secrets(namespace).Watch(opts)
+				return kubeclientset.CoreV1().Secrets(namespace).Watch(ctx, opts)
 			},
 		},
 		&corev1.Secret{}, 0, cache.Indexers{},
@@ -141,27 +149,27 @@ func NewController(
 	secretsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			key, err := cache.MetaNamespaceKeyFunc(obj)
-			log.Infof("Processing add: %s", key)
+			log.Infof("Processing cluster add: %s", key)
 			if err == nil {
 				queue.Add(key)
 			}
 		},
 		UpdateFunc: func(oldObj interface{}, newObj interface{}) {
 			key, err := cache.MetaNamespaceKeyFunc(newObj)
-			log.Infof("Processing update: %s", key)
+			log.Infof("Processing cluster update: %s", key)
 			if err == nil {
 				queue.Add(key)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
 			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-			log.Infof("Processing delete: %s", key)
+			log.Infof("Processing cluster delete: %s", key)
 			if err == nil {
 				queue.Add(key)
 			}
 		},
 	})
-
+	remoteClustersMetric = common.NewGaugeFrom(common.ClustersMonitoredMetricName, "Gauge for the clusters monitored by Admiral")
 	return controller
 }
 
@@ -187,16 +195,17 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 
 // StartSecretController creates the secret controller.
 func StartSecretController(
+	ctx context.Context,
 	k8s kubernetes.Interface,
 	addCallback addSecretCallback,
 	updateCallback updateSecretCallback,
 	removeCallback removeSecretCallback,
 	namespace string,
-	ctx context.Context,
+	admiralProfile string,
 	secretResolverType string) (*Controller, error) {
 
 	clusterStore := newClustersStore()
-	controller := NewController(k8s, namespace, clusterStore, addCallback, updateCallback, removeCallback, secretResolverType)
+	controller := NewController(k8s, namespace, clusterStore, addCallback, updateCallback, removeCallback, admiralProfile, secretResolverType)
 
 	go controller.Run(ctx.Done())
 
@@ -303,7 +312,7 @@ func (c *Controller) addMemberCluster(secretName string, s *corev1.Secret) {
 
 			c.Cs.RemoteClusters[clusterID] = remoteCluster
 
-			if err := c.addCallback(restConfig, clusterID, common.GetAdmiralParams().CacheRefreshDuration); err != nil {
+			if err := c.addCallback(restConfig, clusterID, common.GetResyncIntervals()); err != nil {
 				log.Errorf("error during secret loading for clusterID: %s %v", clusterID, err)
 				continue
 			}
@@ -327,13 +336,13 @@ func (c *Controller) addMemberCluster(secretName string, s *corev1.Secret) {
 			}
 
 			c.Cs.RemoteClusters[clusterID] = remoteCluster
-			if err := c.updateCallback(restConfig, clusterID, common.GetAdmiralParams().CacheRefreshDuration); err != nil {
+			if err := c.updateCallback(restConfig, clusterID, common.GetResyncIntervals()); err != nil {
 				log.Errorf("Error updating cluster_id from secret=%v: %s %v",
 					clusterID, secretName, err)
 			}
 		}
-
 	}
+	remoteClustersMetric.Set(float64(len(c.Cs.RemoteClusters)))
 	log.Infof("Number of remote clusters: %d", len(c.Cs.RemoteClusters))
 }
 
@@ -346,7 +355,46 @@ func (c *Controller) deleteMemberCluster(secretName string) {
 				log.Errorf("error during cluster delete: %s %v", clusterID, err)
 			}
 			delete(c.Cs.RemoteClusters, clusterID)
+			log.Infof("Deleting kubeconfig from cache for secret: %s", clusterID)
+			err = c.secretResolver.DeleteClusterFromCache(clusterID)
+			if err != nil {
+				log.Errorf("error deleting cluster from cache: %s %v", clusterID, err)
+			}
 		}
 	}
+	remoteClustersMetric.Set(float64(len(c.Cs.RemoteClusters)))
 	log.Infof("Number of remote clusters: %d", len(c.Cs.RemoteClusters))
+}
+
+func getShardNameFromClusterSecret(secret *corev1.Secret) (string, error) {
+	if !common.IsAdmiralStateSyncerMode() {
+		return "", nil
+	}
+	if secret == nil {
+		return "", fmt.Errorf("nil secret passed")
+	}
+	annotation := secret.GetAnnotations()
+	if len(annotation) == 0 {
+		return "", fmt.Errorf("no annotations found on secret=%s", secret.GetName())
+	}
+	shard, ok := annotation[util.SecretShardKey]
+	if ok {
+		return shard, nil
+	}
+	return "", fmt.Errorf("shard not found")
+}
+
+func (c *Controller) addClusterToShard(cluster, shard string) error {
+	if !common.IsAdmiralStateSyncerMode() {
+		return nil
+	}
+	return c.clusterShardStoreHandler.AddClusterToShard(cluster, shard)
+}
+
+// TODO: invoke function in delete workflow
+func (c *Controller) removeClusterFromShard(cluster, shard string) error {
+	if !common.IsAdmiralStateSyncerMode() {
+		return nil
+	}
+	return c.clusterShardStoreHandler.RemoveClusterFromShard(cluster, shard)
 }

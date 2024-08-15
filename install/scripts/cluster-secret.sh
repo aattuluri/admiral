@@ -16,6 +16,15 @@ fi
 
 #TBD make sure you have context switched
 export KUBECONFIG=$remote_cluster
+if [ -z "$KUBECONFIG" ]
+then
+    echo "\$KUBECONFIG is not set"
+    exit 1
+elif [[ $KUBECONFIG == *"ppd"* || $KUBECONFIG == *"prd"* || $KUBECONFIG == *"prod"* ]]
+then
+    echo "\$KUBECONFIG is not for a dev cluster"
+    exit 1
+fi
 
 #prep for creating kubeconfig of remote cluster
 export WORK_DIR=$(pwd)
@@ -24,7 +33,7 @@ export KUBECFG_FILE=/tmp/${CLUSTER_NAME}
 SERVER=$(kubectl config view --minify=true -o "jsonpath={.clusters[].cluster.server}")
 NAMESPACE_SYNC=admiral-sync
 SERVICE_ACCOUNT=admiral
-SECRET_NAME=$(kubectl get sa ${SERVICE_ACCOUNT} -n ${NAMESPACE_SYNC} -o jsonpath='{.secrets[].name}')
+SECRET_NAME=admiral-token
 CA_DATA=$(kubectl get secret ${SECRET_NAME} -n ${NAMESPACE_SYNC} -o "jsonpath={.data['ca\.crt']}")
 RAW_TOKEN=$(kubectl get secret ${SECRET_NAME} -n ${NAMESPACE_SYNC} -o "jsonpath={.data['token']}")
 TOKEN=$(kubectl get secret ${SECRET_NAME} -n ${NAMESPACE_SYNC} -o "jsonpath={.data['token']}" | base64 --decode)
@@ -68,6 +77,15 @@ source remote_cluster_env_vars
 #export KUBECONFIG=~/.kube/config
 #kubectx minikube
 export KUBECONFIG=$local_cluster
+if [ -z "$KUBECONFIG" ]
+then
+    echo "\$KUBECONFIG is not set"
+    exit 1
+elif [[ $KUBECONFIG == *"ppd"* || $KUBECONFIG == *"prd"* || $KUBECONFIG == *"prod"* ]]
+then
+    echo "\$KUBECONFIG is not for a dev cluster"
+    exit 1
+fi
 
 kubectl delete secret ${CLUSTER_NAME} -n $namespace_secrets
 kubectl create secret generic ${CLUSTER_NAME} --from-file ${KUBECFG_FILE} -n $namespace_secrets

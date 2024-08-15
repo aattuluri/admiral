@@ -2,12 +2,19 @@ package clusters
 
 import (
 	"context"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
 	"github.com/google/go-cmp/cmp"
 	depModel "github.com/istio-ecosystem/admiral/admiral/pkg/apis/admiral/model"
-	"github.com/istio-ecosystem/admiral/admiral/pkg/apis/admiral/v1"
+	v1 "github.com/istio-ecosystem/admiral/admiral/pkg/apis/admiral/v1alpha1"
+	"github.com/istio-ecosystem/admiral/admiral/pkg/client/loader"
 	"github.com/istio-ecosystem/admiral/admiral/pkg/controller/admiral"
 	"github.com/istio-ecosystem/admiral/admiral/pkg/controller/common"
 	"github.com/istio-ecosystem/admiral/admiral/pkg/test"
+	"github.com/istio-ecosystem/admiral/admiral/pkg/util"
 	"github.com/sirupsen/logrus"
 	logTest "github.com/sirupsen/logrus/hooks/test"
 	networking "istio.io/api/networking/v1alpha3"
@@ -17,61 +24,62 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"strings"
-	"testing"
-	"time"
 )
 
-func init() {
-	p := common.AdmiralParams{
-		KubeconfigPath:             "testdata/fake.config",
-		LabelSet:                   &common.LabelSet{},
-		EnableSAN:                  true,
-		SANPrefix:                  "prefix",
-		HostnameSuffix:             "mesh",
-		SyncNamespace:              "ns",
-		CacheRefreshDuration:       time.Minute,
-		ClusterRegistriesNamespace: "default",
-		DependenciesNamespace:      "default",
-		SecretResolver:             "",
-		WorkloadSidecarUpdate:      "enabled",
-		WorkloadSidecarName:        "default",
+var registryTestSingleton sync.Once
+
+func admiralParamsForRegistryTests() common.AdmiralParams {
+	return common.AdmiralParams{
+		LabelSet: &common.LabelSet{
+			WorkloadIdentityKey:     "identity",
+			AdmiralCRDIdentityLabel: "identity",
+			PriorityKey:             "priority",
+			EnvKey:                  "admiral.io/env",
+		},
+		KubeconfigPath:                "testdata/fake.config",
+		EnableSAN:                     true,
+		SANPrefix:                     "prefix",
+		HostnameSuffix:                "mesh",
+		SyncNamespace:                 "ns",
+		CacheReconcileDuration:        1 * time.Minute,
+		SeAndDrCacheReconcileDuration: 1 * time.Minute,
+		ClusterRegistriesNamespace:    "default",
+		DependenciesNamespace:         "default",
+		WorkloadSidecarUpdate:         "enabled",
+		WorkloadSidecarName:           "default",
+		EnableRoutingPolicy:           true,
+		EnvoyFilterVersion:            "1.13",
+		Profile:                       common.AdmiralProfileDefault,
 	}
+}
 
-	p.LabelSet.WorkloadIdentityKey = "identity"
-	p.LabelSet.GlobalTrafficDeploymentLabel = "identity"
-
-	common.InitializeConfig(p)
+func setupForRegistryTests() {
+	registryTestSingleton.Do(func() {
+		common.ResetSync()
+		common.InitializeConfig(admiralParamsForRegistryTests())
+	})
 }
 
 func TestDeleteCacheControllerThatDoesntExist(t *testing.T) {
-
-	w := RemoteRegistry{
-		RemoteControllers: make(map[string]*RemoteController),
-	}
-
+	setupForRegistryTests()
+	w := NewRemoteRegistry(nil, common.AdmiralParams{})
 	err := w.deleteCacheController("I don't exit")
-
 	if err != nil {
 		t.Fail()
 	}
 }
 
 func TestDeleteCacheController(t *testing.T) {
-
-	w := RemoteRegistry{
-		RemoteControllers: make(map[string]*RemoteController),
-	}
-
+	setupForRegistryTests()
+	w := NewRemoteRegistry(context.TODO(), common.AdmiralParams{})
 	r := rest.Config{
 		Host: "test.com",
 	}
-
 	cluster := "test.cluster"
-	w.createCacheController(&r, cluster, time.Second*time.Duration(300))
-	_, ok := w.RemoteControllers[cluster]
+	w.createCacheController(&r, cluster, util.ResyncIntervals{UniversalReconcileInterval: 300 * time.Second, SeAndDrReconcileInterval: 300 * time.Second})
+	rc := w.GetRemoteController(cluster)
 
-	if !ok {
+	if rc == nil {
 		t.Fail()
 	}
 
@@ -80,15 +88,15 @@ func TestDeleteCacheController(t *testing.T) {
 	if err != nil {
 		t.Fail()
 	}
-	_, ok = w.RemoteControllers[cluster]
+	rc = w.GetRemoteController(cluster)
 
-	if ok {
+	if rc != nil {
 		t.Fail()
 	}
 }
 
 func TestCopyServiceEntry(t *testing.T) {
-
+	setupForRegistryTests()
 	se := networking.ServiceEntry{
 		Hosts: []string{"test.com"},
 	}
@@ -101,8 +109,8 @@ func TestCopyServiceEntry(t *testing.T) {
 }
 
 func TestCopyEndpoint(t *testing.T) {
-
-	se := networking.ServiceEntry_Endpoint{
+	setupForRegistryTests()
+	se := networking.WorkloadEntry{
 		Address: "127.0.0.1",
 	}
 
@@ -115,12 +123,14 @@ func TestCopyEndpoint(t *testing.T) {
 }
 
 func TestCopySidecar(t *testing.T) {
+	setupForRegistryTests()
 	spec := networking.Sidecar{
 		WorkloadSelector: &networking.WorkloadSelector{
 			Labels: map[string]string{"TestLabel": "TestValue"},
 		},
 	}
 
+	//nolint
 	sidecar := v1alpha3.Sidecar{Spec: spec}
 
 	newSidecar := copySidecar(&sidecar)
@@ -130,73 +140,37 @@ func TestCopySidecar(t *testing.T) {
 	}
 }
 
-func TestCreateDestinationRuleForLocalNoDeployLabel(t *testing.T) {
-
-	config := rest.Config{
-		Host: "localhost",
-	}
-
-	d, e := admiral.NewDeploymentController(make(chan struct{}), &test.MockDeploymentHandler{}, &config, time.Second*time.Duration(300))
-
-	if e != nil {
-		t.Fail()
-	}
-
-	rc := RemoteController{
-		DeploymentController: d,
-	}
-
-	des := networking.DestinationRule{
-		Host: "test.com",
-		Subsets: []*networking.Subset{
-			{Name: "subset1", Labels: map[string]string{"foo": "bar"}, TrafficPolicy: nil},
-		},
-	}
-
-	createDestinationRuleForLocal(&rc, "local.name", "identity", "cluster1", &des)
-
-}
-
-func TestCreateDestinationRuleForLocal(t *testing.T) {
-
-	rc, err := createMockRemoteController(
-		func(i interface{}) {
-
-		},
-	)
-
-	if err != nil {
-		t.Fail()
-	}
-	des := networking.DestinationRule{
-		Host: "dev.bar.global",
-		Subsets: []*networking.Subset{
-			{Name: "subset1", Labels: map[string]string{"foo": "bar"}, TrafficPolicy: nil},
-		},
-	}
-
-	createDestinationRuleForLocal(rc, "local.name", "bar", "cluster1", &des)
-
-}
-
 func createMockRemoteController(f func(interface{})) (*RemoteController, error) {
 	config := rest.Config{
 		Host: "localhost",
 	}
 	stop := make(chan struct{})
-	d, e := admiral.NewDeploymentController(stop, &test.MockDeploymentHandler{}, &config, time.Second*time.Duration(300))
-	s, e := admiral.NewServiceController(stop, &test.MockServiceHandler{}, &config, time.Second*time.Duration(300))
-	n, e := admiral.NewNodeController(stop, &test.MockNodeHandler{}, &config)
-	r, e := admiral.NewRolloutsController(stop, &test.MockRolloutHandler{}, &config, time.Second*time.Duration(300))
-
-	if e != nil {
-		return nil, e
+	d, err := admiral.NewDeploymentController(stop, &test.MockDeploymentHandler{}, &config, time.Second*time.Duration(300), loader.GetFakeClientLoader())
+	if err != nil {
+		return nil, err
+	}
+	s, err := admiral.NewServiceController(stop, &test.MockServiceHandler{}, &config, time.Second*time.Duration(300), loader.GetFakeClientLoader())
+	if err != nil {
+		return nil, err
+	}
+	n, err := admiral.NewNodeController(stop, &test.MockNodeHandler{}, &config, loader.GetFakeClientLoader())
+	if err != nil {
+		return nil, err
+	}
+	r, err := admiral.NewRolloutsController(stop, &test.MockRolloutHandler{}, &config, time.Second*time.Duration(300), loader.GetFakeClientLoader())
+	if err != nil {
+		return nil, err
+	}
+	rpc, err := admiral.NewRoutingPoliciesController(stop, &test.MockRoutingPolicyHandler{}, &config, time.Second*time.Duration(300), loader.GetFakeClientLoader())
+	if err != nil {
+		return nil, err
 	}
 
 	deployment := k8sAppsV1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
 			Namespace: "test",
+			Labels:    map[string]string{"sidecar.istio.io/inject": "true", "identity": "bar", "env": "dev"},
 		},
 		Spec: k8sAppsV1.DeploymentSpec{
 			Selector: &metav1.LabelSelector{
@@ -204,12 +178,14 @@ func createMockRemoteController(f func(interface{})) (*RemoteController, error) 
 			},
 			Template: k8sCoreV1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{"identity": "bar", "istio-injected": "true", "env": "dev"},
+					Annotations: map[string]string{"sidecar.istio.io/inject": "true"},
+					Labels:      map[string]string{"identity": "bar", "istio-injected": "true", "env": "dev"},
 				},
 			},
 		},
 	}
-	d.Added(&deployment)
+	ctx := context.Background()
+	d.Added(ctx, &deployment)
 	service := k8sCoreV1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
@@ -222,30 +198,29 @@ func createMockRemoteController(f func(interface{})) (*RemoteController, error) 
 			},
 		},
 	}
-	s.Added(&service)
+	s.Added(ctx, &service)
 
 	rc := RemoteController{
-		DeploymentController: d,
-		ServiceController:    s,
-		NodeController:       n,
-		ClusterID:            "test.cluster",
-		RolloutController:    r,
+		DeploymentController:    d,
+		ServiceController:       s,
+		NodeController:          n,
+		ClusterID:               "test.cluster",
+		RolloutController:       r,
+		RoutingPolicyController: rpc,
 	}
 	return &rc, nil
 }
 
 func TestCreateSecretController(t *testing.T) {
-	rr := RemoteRegistry{}
-	err := createSecretController(context.Background(), &rr)
-
+	setupForRegistryTests()
+	err := createSecretController(context.Background(), NewRemoteRegistry(nil, common.AdmiralParams{}))
 	if err != nil {
 		t.Fail()
 	}
 
 	common.SetKubeconfigPath("fail")
 
-	rr = RemoteRegistry{}
-	err = createSecretController(context.Background(), &rr)
+	err = createSecretController(context.Background(), NewRemoteRegistry(context.TODO(), common.AdmiralParams{}))
 
 	common.SetKubeconfigPath("testdata/fake.config")
 
@@ -255,20 +230,18 @@ func TestCreateSecretController(t *testing.T) {
 }
 
 func TestInitAdmiral(t *testing.T) {
-
+	setupForRegistryTests()
 	p := common.AdmiralParams{
 		KubeconfigPath: "testdata/fake.config",
 		LabelSet:       &common.LabelSet{},
 	}
-
 	p.LabelSet.WorkloadIdentityKey = "overridden-key"
-
 	rr, err := InitAdmiral(context.Background(), p)
 
 	if err != nil {
 		t.Fail()
 	}
-	if len(rr.RemoteControllers) != 0 {
+	if len(rr.GetClusterIds()) != 0 {
 		t.Fail()
 	}
 
@@ -278,7 +251,8 @@ func TestInitAdmiral(t *testing.T) {
 }
 
 func TestAdded(t *testing.T) {
-
+	setupForRegistryTests()
+	ctx := context.Background()
 	p := common.AdmiralParams{
 		KubeconfigPath: "testdata/fake.config",
 	}
@@ -287,16 +261,17 @@ func TestAdded(t *testing.T) {
 	rc, _ := createMockRemoteController(func(i interface{}) {
 		t.Fail()
 	})
-	rr.RemoteControllers["test.cluster"] = rc
-	d, e := admiral.NewDependencyController(make(chan struct{}), &test.MockDependencyHandler{}, p.KubeconfigPath, "dep-ns", time.Second*time.Duration(300))
+	rr.PutRemoteController("test.cluster", rc)
+	d, e := admiral.NewDependencyController(make(chan struct{}), &test.MockDependencyHandler{}, p.KubeconfigPath, "dep-ns", time.Second*time.Duration(300), loader.GetFakeClientLoader())
 
 	if e != nil {
 		t.Fail()
 	}
 
 	dh := DependencyHandler{
-		RemoteRegistry: rr,
-		DepController:  d,
+		RemoteRegistry:              rr,
+		DepController:               d,
+		DestinationServiceProcessor: &MockDestinationServiceProcessor{},
 	}
 
 	depData := v1.Dependency{
@@ -307,62 +282,17 @@ func TestAdded(t *testing.T) {
 		},
 	}
 
-	dh.Added(&depData)
-	dh.Deleted(&depData)
+	dh.Added(ctx, &depData)
+	dh.Deleted(ctx, &depData)
 
-}
-
-func TestPodHandler(t *testing.T) {
-
-	p := common.AdmiralParams{
-		KubeconfigPath: "testdata/fake.config",
-	}
-
-	rr, _ := InitAdmiral(context.Background(), p)
-
-	rc, _ := createMockRemoteController(func(i interface{}) {
-
-	})
-	rr.RemoteControllers["test.cluster"] = rc
-
-	ph := PodHandler{
-		RemoteRegistry: rr,
-	}
-
-	pod := k8sCoreV1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test",
-			Namespace: "test",
-		},
-		Spec: k8sCoreV1.PodSpec{
-			Hostname: "test.local",
-		},
-	}
-
-	ph.Added(&pod)
-
-	ph.Deleted(&pod)
 }
 
 func TestGetServiceForDeployment(t *testing.T) {
+	setupForRegistryTests()
 	baseRc, _ := createMockRemoteController(func(i interface{}) {
-		//res := i.(istio.Config)
-		//se, ok := res.Spec.(*v1alpha3.ServiceEntry)
-		//if ok {
-		//	if se.Hosts[0] != "dev.bar.global" {
-		//		t.Errorf("Host mismatch. Expected dev.bar.global, got %v", se.Hosts[0])
-		//	}
-		//}
 	})
 
 	rcWithService, _ := createMockRemoteController(func(i interface{}) {
-		//res := i.(istio.Config)
-		//se, ok := res.Spec.(*networking.ServiceEntry)
-		//if ok {
-		//	if se.Hosts[0] != "dev.bar.global" {
-		//		t.Errorf("Host mismatch. Expected dev.bar.global, got %v", se.Hosts[0])
-		//	}
-		//}
 	})
 
 	service := k8sCoreV1.Service{}
@@ -416,7 +346,7 @@ func TestGetServiceForDeployment(t *testing.T) {
 	//Run the test for every provided case
 	for _, c := range testCases {
 		t.Run(c.name, func(t *testing.T) {
-			resultingService := getServiceForDeployment(c.controller, c.deployment)
+			resultingService, _ := getServiceForDeployment(c.controller, c.deployment)
 			if resultingService == nil && c.expectedService == nil {
 				//perfect
 			} else {
@@ -430,10 +360,16 @@ func TestGetServiceForDeployment(t *testing.T) {
 }
 
 func TestUpdateCacheController(t *testing.T) {
+	setupForRegistryTests()
 	p := common.AdmiralParams{
-		KubeconfigPath: "testdata/fake.config",
+		KubeconfigPath:                "testdata/fake.config",
+		CacheReconcileDuration:        300 * time.Second,
+		SeAndDrCacheReconcileDuration: 150 * time.Second,
 	}
 	originalConfig, err := clientcmd.BuildConfigFromFlags("", "testdata/fake.config")
+	if err != nil {
+		t.Fatalf("unexpected error when building client with testdata/fake.config, err: %v", err)
+	}
 	changedConfig, err := clientcmd.BuildConfigFromFlags("", "testdata/fake_2.config")
 	if err != nil {
 		t.Fatalf("Unexpected error getting client %v", err)
@@ -445,28 +381,28 @@ func TestUpdateCacheController(t *testing.T) {
 		t.Fail()
 	})
 	rc.stop = make(chan struct{})
-	rr.RemoteControllers["test.cluster"] = rc
+	rr.PutRemoteController("test.cluster", rc)
 
 	//Struct of test case info. Name is required.
 	testCases := []struct {
-		name string
-		oldConfig *rest.Config
-		newConfig *rest.Config
-		clusterId string
+		name          string
+		oldConfig     *rest.Config
+		newConfig     *rest.Config
+		clusterId     string
 		shouldRefresh bool
 	}{
 		{
-			name: "Should update controller when kubeconfig changes",
-			oldConfig: originalConfig,
-			newConfig: changedConfig,
-			clusterId: "test.cluster",
+			name:          "Should update controller when kubeconfig changes",
+			oldConfig:     originalConfig,
+			newConfig:     changedConfig,
+			clusterId:     "test.cluster",
 			shouldRefresh: true,
 		},
 		{
-			name: "Should not update controller when kubeconfig doesn't change",
-			oldConfig: originalConfig,
-			newConfig: originalConfig,
-			clusterId: "test.cluster",
+			name:          "Should not update controller when kubeconfig doesn't change",
+			oldConfig:     originalConfig,
+			newConfig:     originalConfig,
+			clusterId:     "test.cluster",
 			shouldRefresh: false,
 		},
 	}
@@ -475,20 +411,20 @@ func TestUpdateCacheController(t *testing.T) {
 	for _, c := range testCases {
 		t.Run(c.name, func(t *testing.T) {
 			hook := logTest.NewGlobal()
-			rr.RemoteControllers[c.clusterId].ApiServer = c.oldConfig.Host
-			d, err := admiral.NewDeploymentController(make(chan struct{}), &test.MockDeploymentHandler{}, c.oldConfig,  time.Second*time.Duration(300))
+			rr.GetRemoteController(c.clusterId).ApiServer = c.oldConfig.Host
+			d, err := admiral.NewDeploymentController(make(chan struct{}), &test.MockDeploymentHandler{}, c.oldConfig, time.Second*time.Duration(300), loader.GetFakeClientLoader())
 			if err != nil {
 				t.Fatalf("Unexpected error creating controller %v", err)
 			}
 			rc.DeploymentController = d
 
-			err = rr.updateCacheController(c.newConfig, c.clusterId, time.Second*time.Duration(300))
+			err = rr.updateCacheController(c.newConfig, c.clusterId, common.GetResyncIntervals())
 			if err != nil {
 				t.Fatalf("Unexpected error doing update %v", err)
 			}
 
-			if rr.RemoteControllers[c.clusterId].ApiServer != c.newConfig.Host {
-				t.Fatalf("Client mismatch. Updated controller has the wrong client. Expected %v got %v", c.newConfig.Host, rr.RemoteControllers[c.clusterId].ApiServer)
+			if rr.GetRemoteController(c.clusterId).ApiServer != c.newConfig.Host {
+				t.Fatalf("Client mismatch. Updated controller has the wrong client. Expected %v got %v", c.newConfig.Host, rr.GetRemoteController(c.clusterId).ApiServer)
 			}
 
 			refreshed := checkIfLogged(hook.AllEntries(), "Client mismatch, recreating cache controllers for cluster")
@@ -507,4 +443,62 @@ func checkIfLogged(entries []*logrus.Entry, phrase string) bool {
 		}
 	}
 	return false
+}
+
+func TestInitAdmiralOperator(t *testing.T) {
+	var (
+		ctx                 = context.TODO()
+		dummyKubeConfig     = "./testdata/fake.config"
+		dependencyNamespace = "dependency-ns"
+	)
+	testCases := []struct {
+		name        string
+		params      common.AdmiralParams
+		assertFunc  func(rr *RemoteRegistry, t *testing.T)
+		expectedErr error
+	}{
+		{
+			name: "Given Admiral is running in Operator mode, " +
+				"When InitAdmiralOperator is invoked with correct parameters, " +
+				"Then, it should return RemoteRegistry which has a ShardController and RegistryClient",
+			params: common.AdmiralParams{
+				AdmiralOperatorMode:   true,
+				KubeconfigPath:        dummyKubeConfig,
+				DependenciesNamespace: dependencyNamespace,
+			},
+			assertFunc: func(rr *RemoteRegistry, t *testing.T) {
+				if rr == nil {
+					t.Error("expected RemoteRegistry to be initialized, but got nil")
+				}
+				// check if it has ShardController initialized
+				if rr != nil && rr.ShardController == nil {
+					t.Error("expected ShardController to be initialized, but it was not")
+				}
+				// check if it has a RegistryClient initialized
+				if rr != nil && rr.RegistryClient == nil {
+					t.Error("expected RegistryClient to be initialized, but it was not")
+				}
+			},
+			expectedErr: nil,
+		},
+	}
+
+	for _, c := range testCases {
+		t.Run(c.name, func(t *testing.T) {
+			common.ResetSync()
+			rr, err := InitAdmiralOperator(ctx, c.params)
+			if c.expectedErr == nil && err != nil {
+				t.Errorf("expected: nil, got: %v", err)
+			}
+			if c.expectedErr != nil {
+				if err == nil {
+					t.Errorf("expected: %v, got: %v", c.expectedErr, err)
+				}
+				if err != nil && c.expectedErr.Error() != err.Error() {
+					t.Errorf("expected: %v, got: %v", c.expectedErr, err)
+				}
+			}
+			c.assertFunc(rr, t)
+		})
+	}
 }

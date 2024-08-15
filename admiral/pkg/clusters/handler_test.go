@@ -1,104 +1,47 @@
 package clusters
 
 import (
-	"reflect"
-	"strings"
+	"context"
 	"testing"
 	"time"
 
 	argo "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
-	"github.com/gogo/protobuf/types"
-	"github.com/google/go-cmp/cmp"
-	"github.com/istio-ecosystem/admiral/admiral/pkg/apis/admiral/model"
+	cmp "github.com/google/go-cmp/cmp"
+	"github.com/istio-ecosystem/admiral/admiral/pkg/client/loader"
 	"github.com/istio-ecosystem/admiral/admiral/pkg/controller/admiral"
 	"github.com/istio-ecosystem/admiral/admiral/pkg/controller/common"
 	"github.com/istio-ecosystem/admiral/admiral/pkg/controller/istio"
 	"github.com/istio-ecosystem/admiral/admiral/pkg/test"
-	"github.com/stretchr/testify/assert"
 	"istio.io/api/networking/v1alpha3"
 	v1alpha32 "istio.io/client-go/pkg/apis/networking/v1alpha3"
-	istiofake "istio.io/client-go/pkg/clientset/versioned/fake"
+	istioFake "istio.io/client-go/pkg/clientset/versioned/fake"
+
 	coreV1 "k8s.io/api/core/v1"
-	k8sV1 "k8s.io/api/core/v1"
-	k8sv1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	v12 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 )
 
-func TestGetDependentClusters(t *testing.T) {
-
-	identityClusterCache := common.NewMapOfMaps()
-	identityClusterCache.Put("id1", "dep1", "cl1")
-	identityClusterCache.Put("id2", "dep2", "cl2")
-	identityClusterCache.Put("id3", "dep3", "cl3")
-
-	testCases := []struct {
-		name                 string
-		dependents           map[string]string
-		identityClusterCache *common.MapOfMaps
-		sourceServices       map[string]*k8sV1.Service
-		expectedResult       map[string]string
-	}{
-		{
-			name:           "nil dependents map",
-			dependents:     nil,
-			expectedResult: make(map[string]string),
-		},
-		{
-			name:                 "empty dependents map",
-			dependents:           map[string]string{},
-			identityClusterCache: identityClusterCache,
-			expectedResult:       map[string]string{},
-		},
-		{
-			name: "no dependent match",
-			dependents: map[string]string{
-				"id99": "val1",
-			},
-			identityClusterCache: identityClusterCache,
-			expectedResult:       map[string]string{},
-		},
-		{
-			name: "no service for matched dep cluster",
-			dependents: map[string]string{
-				"id1": "val1",
-			},
-			identityClusterCache: identityClusterCache,
-			sourceServices: map[string]*k8sV1.Service{
-				"cl1": &k8sV1.Service{},
-			},
-			expectedResult: map[string]string{},
-		},
-		{
-			name: "found service for matched dep cluster",
-			dependents: map[string]string{
-				"id1": "val1",
-			},
-			identityClusterCache: identityClusterCache,
-			sourceServices: map[string]*k8sV1.Service{
-				"cl99": &k8sV1.Service{
-					ObjectMeta: v12.ObjectMeta{
-						Name: "testservice",
-					},
-				},
-			},
-			expectedResult: map[string]string{
-				"cl1": "cl1",
-			},
-		},
+func admiralParamsForHandlerTests(argoEnabled bool) common.AdmiralParams {
+	return common.AdmiralParams{
+		ArgoRolloutsEnabled: argoEnabled,
+		LabelSet:            &common.LabelSet{},
 	}
+}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			actualResult := getDependentClusters(tc.dependents, tc.identityClusterCache, tc.sourceServices)
-			assert.Equal(t, len(tc.expectedResult), len(actualResult))
-			assert.True(t, reflect.DeepEqual(actualResult, tc.expectedResult))
-		})
-	}
-
+func setupForHandlerTests(argoEnabled bool) {
+	common.ResetSync()
+	common.InitializeConfig(admiralParamsForHandlerTests(argoEnabled))
 }
 
 func TestIgnoreIstioResource(t *testing.T) {
+
+	admiralParams := common.AdmiralParams{
+		LabelSet:             &common.LabelSet{},
+		TrafficConfigPersona: false,
+		SyncNamespace:        "ns",
+	}
+	common.ResetSync()
+	common.InitializeConfig(admiralParams)
 
 	//Struct of test case info. Name is required.
 	testCases := []struct {
@@ -157,6 +100,13 @@ func TestIgnoreIstioResource(t *testing.T) {
 			namespace:      "ns",
 			expectedResult: true,
 		},
+		{
+			name:           "created by cartographer",
+			exportTo:       []string{"namespace1", "namespace2"},
+			annotations:    map[string]string{common.CreatedBy: common.Cartographer},
+			namespace:      "random-namespace",
+			expectedResult: true,
+		},
 	}
 
 	//Run the test for every provided case
@@ -172,338 +122,127 @@ func TestIgnoreIstioResource(t *testing.T) {
 	}
 }
 
-func TestGetDestinationRule(t *testing.T) {
-	//Do setup here
-	outlierDetection := &v1alpha3.OutlierDetection{
-		BaseEjectionTime:      &types.Duration{Seconds: 300},
-		Consecutive_5XxErrors: &types.UInt32Value{Value: 10},
-		Interval:              &types.Duration{Seconds: 60}}
-	mTLS := &v1alpha3.TrafficPolicy{Tls: &v1alpha3.TLSSettings{Mode: v1alpha3.TLSSettings_ISTIO_MUTUAL}, OutlierDetection: outlierDetection}
-
-	noGtpDr := v1alpha3.DestinationRule{
-		Host:          "qa.myservice.global",
-		TrafficPolicy: mTLS,
-	}
-
-	basicGtpDr := v1alpha3.DestinationRule{
-		Host: "qa.myservice.global",
-		TrafficPolicy: &v1alpha3.TrafficPolicy{
-			Tls: &v1alpha3.TLSSettings{Mode: v1alpha3.TLSSettings_ISTIO_MUTUAL},
-			LoadBalancer: &v1alpha3.LoadBalancerSettings{
-				LbPolicy:          &v1alpha3.LoadBalancerSettings_Simple{Simple: v1alpha3.LoadBalancerSettings_ROUND_ROBIN},
-				LocalityLbSetting: &v1alpha3.LocalityLoadBalancerSetting{},
-			},
-			OutlierDetection: outlierDetection,
-		},
-	}
-
-	failoverGtpDr := v1alpha3.DestinationRule{
-		Host: "qa.myservice.global",
-		TrafficPolicy: &v1alpha3.TrafficPolicy{
-			Tls: &v1alpha3.TLSSettings{Mode: v1alpha3.TLSSettings_ISTIO_MUTUAL},
-			LoadBalancer: &v1alpha3.LoadBalancerSettings{
-				LbPolicy: &v1alpha3.LoadBalancerSettings_Simple{Simple: v1alpha3.LoadBalancerSettings_ROUND_ROBIN},
-				LocalityLbSetting: &v1alpha3.LocalityLoadBalancerSetting{
-					Distribute: []*v1alpha3.LocalityLoadBalancerSetting_Distribute{
-						{
-							From: "uswest2/*",
-							To:   map[string]uint32{"us-west-2": 100},
-						},
-					},
-				},
-			},
-			OutlierDetection: outlierDetection,
-		},
-	}
-
-	topologyGTPPolicy := &model.TrafficPolicy{
-		LbType: model.TrafficPolicy_TOPOLOGY,
-		Target: []*model.TrafficGroup{
-			{
-				Region: "us-west-2",
-				Weight: 100,
-			},
-		},
-	}
-
-	failoverGTPPolicy := &model.TrafficPolicy{
-		LbType: model.TrafficPolicy_FAILOVER,
-		Target: []*model.TrafficGroup{
-			{
-				Region: "us-west-2",
-				Weight: 100,
-			},
-			{
-				Region: "us-east-2",
-				Weight: 0,
-			},
-		},
-	}
-
-	//Struct of test case info. Name is required.
-	testCases := []struct {
-		name            string
-		host            string
-		locality        string
-		gtpPolicy       *model.TrafficPolicy
-		destinationRule *v1alpha3.DestinationRule
-	}{
-		{
-			name:            "Should handle a nil GTP",
-			host:            "qa.myservice.global",
-			locality:        "uswest2",
-			gtpPolicy:       nil,
-			destinationRule: &noGtpDr,
-		},
-		{
-			name:            "Should return default DR with empty locality",
-			host:            "qa.myservice.global",
-			locality:        "",
-			gtpPolicy:       failoverGTPPolicy,
-			destinationRule: &noGtpDr,
-		},
-		{
-			name:            "Should handle a topology GTP",
-			host:            "qa.myservice.global",
-			locality:        "uswest2",
-			gtpPolicy:       topologyGTPPolicy,
-			destinationRule: &basicGtpDr,
-		},
-		{
-			name:            "Should handle a failover GTP",
-			host:            "qa.myservice.global",
-			locality:        "uswest2",
-			gtpPolicy:       failoverGTPPolicy,
-			destinationRule: &failoverGtpDr,
-		},
-	}
-
-	//Run the test for every provided case
-	for _, c := range testCases {
-		t.Run(c.name, func(t *testing.T) {
-			result := getDestinationRule(c.host, c.locality, c.gtpPolicy)
-			if !cmp.Equal(result, c.destinationRule) {
-				t.Fatalf("DestinationRule Mismatch. Diff: %v", cmp.Diff(result, c.destinationRule))
-			}
-		})
-	}
-}
-
-func TestHandleVirtualServiceEvent(t *testing.T) {
-	tooManyHosts := v1alpha32.VirtualService{
-		Spec: v1alpha3.VirtualService{
-			Hosts: []string{"qa.blah.global", "e2e.blah.global"},
-		},
-	}
-	tooManyHosts.Namespace = "other-ns"
-
-	happyPath := v1alpha32.VirtualService{
-		Spec: v1alpha3.VirtualService{
-			Hosts: []string{"e2e.blah.global"},
-		},
-	}
-	happyPath.Namespace = "other-ns"
-	happyPath.Name = "vs-name"
-
-	vsNotGeneratedByAdmiral := v1alpha32.VirtualService{
-		Spec: v1alpha3.VirtualService{
-			Hosts: []string{"e2e.blah.something"},
-		},
-	}
-	vsNotGeneratedByAdmiral.Namespace = "other-ns"
-	vsNotGeneratedByAdmiral.Name = "vs-name-other-nss"
-
-	cnameCache := common.NewMapOfMaps()
-	noDependencClustersHandler := VirtualServiceHandler{
-		RemoteRegistry: &RemoteRegistry{
-			RemoteControllers: map[string]*RemoteController{},
-			AdmiralCache: &AdmiralCache{
-				CnameDependentClusterCache: cnameCache,
-				SeClusterCache:             common.NewMapOfMaps(),
-			},
-		},
-	}
-
-	fakeIstioClient := istiofake.NewSimpleClientset()
-	goodCnameCache := common.NewMapOfMaps()
-	goodCnameCache.Put("e2e.blah.global", "cluster.k8s.global", "cluster.k8s.global")
-	handlerEmptyClient := VirtualServiceHandler{
-		RemoteRegistry: &RemoteRegistry{
-			RemoteControllers: map[string]*RemoteController{
-				"cluster.k8s.global": &RemoteController{
-					VirtualServiceController: &istio.VirtualServiceController{
-						IstioClient: fakeIstioClient,
-					},
-				},
-			},
-			AdmiralCache: &AdmiralCache{
-				CnameDependentClusterCache: goodCnameCache,
-				SeClusterCache:             common.NewMapOfMaps(),
-			},
-		},
-	}
-
-	fullFakeIstioClient := istiofake.NewSimpleClientset()
-	fullFakeIstioClient.NetworkingV1alpha3().VirtualServices("ns").Create(&v1alpha32.VirtualService{
-		ObjectMeta: v12.ObjectMeta{
-			Name: "vs-name",
-		},
-		Spec: v1alpha3.VirtualService{
-			Hosts: []string{"e2e.blah.global"},
-		},
-	})
-	handlerFullClient := VirtualServiceHandler{
-		ClusterID: "cluster2.k8s.global",
-		RemoteRegistry: &RemoteRegistry{
-			RemoteControllers: map[string]*RemoteController{
-				"cluster.k8s.global": &RemoteController{
-					VirtualServiceController: &istio.VirtualServiceController{
-						IstioClient: fullFakeIstioClient,
-					},
-				},
-			},
-			AdmiralCache: &AdmiralCache{
-				CnameDependentClusterCache: goodCnameCache,
-				SeClusterCache:             common.NewMapOfMaps(),
-			},
-		},
-	}
-
-	//Struct of test case info. Name is required.
-	testCases := []struct {
-		name          string
-		vs            *v1alpha32.VirtualService
-		handler       *VirtualServiceHandler
-		expectedError error
-		event         common.Event
-	}{
-		{
-			name:          "Virtual Service with multiple hosts",
-			vs:            &tooManyHosts,
-			expectedError: nil,
-			handler:       &noDependencClustersHandler,
-			event:         0,
-		},
-		{
-			name:          "No dependent clusters",
-			vs:            &happyPath,
-			expectedError: nil,
-			handler:       &noDependencClustersHandler,
-			event:         0,
-		},
-		{
-			name:          "Add event for VS not generated by Admiral",
-			vs:            &happyPath,
-			expectedError: nil,
-			handler:       &handlerFullClient,
-			event:         0,
-		},
-		{
-			name:          "Update event for VS not generated by Admiral",
-			vs:            &vsNotGeneratedByAdmiral,
-			expectedError: nil,
-			handler:       &handlerFullClient,
-			event:         1,
-		},
-		{
-			name:          "Delete event for VS not generated by Admiral",
-			vs:            &vsNotGeneratedByAdmiral,
-			expectedError: nil,
-			handler:       &handlerFullClient,
-			event:         2,
-		},
-		{
-			name:          "New Virtual Service",
-			vs:            &happyPath,
-			expectedError: nil,
-			handler:       &handlerEmptyClient,
-			event:         0,
-		},
-		{
-			name:          "Existing Virtual Service",
-			vs:            &happyPath,
-			expectedError: nil,
-			handler:       &handlerFullClient,
-			event:         1,
-		},
-		{
-			name:          "Deleted Virtual Service",
-			vs:            &happyPath,
-			expectedError: nil,
-			handler:       &handlerFullClient,
-			event:         2,
-		},
-	}
-
-	//Run the test for every provided case
-	for _, c := range testCases {
-		t.Run(c.name, func(t *testing.T) {
-
-			err := handleVirtualServiceEvent(c.vs, c.handler, c.event, common.VirtualService)
-			if err != c.expectedError {
-				t.Fatalf("Error mismatch, expected %v but got %v", c.expectedError, err)
-			}
-		})
-	}
-}
-
 func TestGetServiceForRolloutCanary(t *testing.T) {
-	//Struct of test case info. Name is required.
-	const NAMESPACE = "namespace"
-	const SERVICENAME = "serviceName"
-	const STABLESERVICENAME = "stableserviceName"
-	const CANARYSERVICENAME = "canaryserviceName"
-	const VS_NAME_1 = "virtualservice1"
-	const VS_NAME_2 = "virtualservice2"
-	const VS_NAME_3 = "virtualservice3"
-	const VS_NAME_4 = "virtualservice4"
-	const VS_ROUTE_PRIMARY = "primary"
-	config := rest.Config{
-		Host: "localhost",
+	const (
+		Namespace                  = "namespace"
+		ServiceName                = "serviceName"
+		StableServiceName          = "stableserviceName"
+		CanaryServiceName          = "canaryserviceName"
+		GeneratedStableServiceName = "hello-" + common.RolloutStableServiceSuffix
+		RootService                = "hello-root-service"
+		vsName1                    = "virtualservice1"
+		vsName2                    = "virtualservice2"
+		vsName3                    = "virtualservice3"
+		vsName4                    = "virtualservice4"
+		vsRoutePrimary             = "primary"
+	)
+	var (
+		config = rest.Config{
+			Host: "localhost",
+		}
+		stop            = make(chan struct{})
+		fakeIstioClient = istioFake.NewSimpleClientset()
+		selectorMap     = map[string]string{
+			"app": "test",
+		}
+		ports = []coreV1.ServicePort{{Port: 8080}, {Port: 8081}}
+	)
+	s, err := admiral.NewServiceController(stop, &test.MockServiceHandler{}, &config, time.Second*time.Duration(300), loader.GetFakeClientLoader())
+	if err != nil {
+		t.Fatalf("failed to initialize service controller, err: %v", err)
 	}
-	stop := make(chan struct{})
-
-	s, e := admiral.NewServiceController(stop, &test.MockServiceHandler{}, &config, time.Second*time.Duration(300))
-	r, e := admiral.NewRolloutsController(stop, &test.MockRolloutHandler{}, &config, time.Second*time.Duration(300))
-
-	fakeIstioClient := istiofake.NewSimpleClientset()
+	r, err := admiral.NewRolloutsController(stop, &test.MockRolloutHandler{}, &config, time.Second*time.Duration(300), loader.GetFakeClientLoader())
+	if err != nil {
+		t.Fatalf("failed ot initialize rollout controller, err: %v", err)
+	}
 
 	v := &istio.VirtualServiceController{
 		IstioClient: fakeIstioClient,
 	}
 
-	if e != nil {
-		t.Fatalf("Inititalization failed")
-	}
-
 	rcTemp := &RemoteController{
 		VirtualServiceController: v,
 		ServiceController:        s,
-		RolloutController:        r}
-
-	selectorMap := make(map[string]string)
-	selectorMap["app"] = "test"
+		RolloutController:        r,
+	}
 
 	service := &coreV1.Service{
+		ObjectMeta: metaV1.ObjectMeta{Name: ServiceName, Namespace: Namespace, CreationTimestamp: metaV1.NewTime(time.Now())},
 		Spec: coreV1.ServiceSpec{
 			Selector: selectorMap,
+			Ports:    ports,
 		},
 	}
-	service.Name = SERVICENAME
-	service.Namespace = NAMESPACE
-	port1 := coreV1.ServicePort{
-		Port: 8080,
+
+	// namespace1 Services
+	service1 := &coreV1.Service{
+		ObjectMeta: metaV1.ObjectMeta{Name: "dummy1", Namespace: "namespace1", CreationTimestamp: metaV1.NewTime(time.Now())},
+		Spec: coreV1.ServiceSpec{
+			Selector: selectorMap,
+			Ports: []coreV1.ServicePort{{
+				Port: 8080,
+				Name: "random3",
+			}, {
+				Port: 8081,
+				Name: "random4",
+			},
+			},
+		},
 	}
 
-	port2 := coreV1.ServicePort{
-		Port: 8081,
+	// namespace4 Services
+	service3 := &coreV1.Service{
+		ObjectMeta: metaV1.ObjectMeta{Name: "dummy3", Namespace: "namespace4", CreationTimestamp: metaV1.NewTime(time.Now())},
+		Spec: coreV1.ServiceSpec{
+			Selector: selectorMap,
+			Ports: []coreV1.ServicePort{{
+				Port: 8080,
+				Name: "random3",
+			}, {
+				Port: 8081,
+				Name: "random4",
+			},
+			},
+		},
 	}
 
-	ports := []coreV1.ServicePort{port1, port2}
-	service.Spec.Ports = ports
+	service4 := &coreV1.Service{
+		ObjectMeta: metaV1.ObjectMeta{Name: "dummy4", Namespace: "namespace4", CreationTimestamp: metaV1.NewTime(time.Now())},
+		Spec: coreV1.ServiceSpec{
+			Selector: selectorMap,
+			Ports: []coreV1.ServicePort{{
+				Port: 8081,
+				Name: "random4",
+			},
+			},
+		},
+	}
 
+	service5 := &coreV1.Service{
+		ObjectMeta: metaV1.ObjectMeta{Name: GeneratedStableServiceName, Namespace: "namespace5", CreationTimestamp: metaV1.NewTime(time.Now())},
+		Spec: coreV1.ServiceSpec{
+			Selector: map[string]string{
+				"app": "test5",
+			},
+			Ports: []coreV1.ServicePort{{
+				Port: 8081,
+				Name: "random5",
+			},
+			},
+		},
+	}
+
+	// namespace Services
 	stableService := &coreV1.Service{
-		ObjectMeta: v12.ObjectMeta{Name: STABLESERVICENAME, Namespace: NAMESPACE},
+		ObjectMeta: metaV1.ObjectMeta{Name: StableServiceName, Namespace: Namespace, CreationTimestamp: metaV1.NewTime(time.Now().Add(time.Duration(-15)))},
+		Spec: coreV1.ServiceSpec{
+			Selector: selectorMap,
+			Ports:    ports,
+		},
+	}
+
+	generatedStableService := &coreV1.Service{
+		ObjectMeta: metaV1.ObjectMeta{Name: GeneratedStableServiceName, Namespace: Namespace, CreationTimestamp: metaV1.NewTime(time.Now().Add(time.Duration(-15)))},
 		Spec: coreV1.ServiceSpec{
 			Selector: selectorMap,
 			Ports:    ports,
@@ -511,122 +250,90 @@ func TestGetServiceForRolloutCanary(t *testing.T) {
 	}
 
 	canaryService := &coreV1.Service{
-		ObjectMeta: v12.ObjectMeta{Name: CANARYSERVICENAME, Namespace: NAMESPACE},
+		ObjectMeta: metaV1.ObjectMeta{Name: CanaryServiceName, Namespace: Namespace, CreationTimestamp: metaV1.NewTime(time.Now().Add(time.Duration(-15)))},
 		Spec: coreV1.ServiceSpec{
 			Selector: selectorMap,
 			Ports:    ports,
 		},
 	}
 
-	selectorMap1 := make(map[string]string)
-	selectorMap1["app"] = "test1"
-	service1 := &coreV1.Service{
+	rootService := &coreV1.Service{
+		ObjectMeta: metaV1.ObjectMeta{Name: RootService, Namespace: Namespace, CreationTimestamp: metaV1.NewTime(time.Now())},
 		Spec: coreV1.ServiceSpec{
 			Selector: selectorMap,
+			Ports:    ports,
 		},
 	}
-	service1.Name = "dummy"
-	service1.Namespace = "namespace1"
-	port3 := coreV1.ServicePort{
-		Port: 8080,
-		Name: "random3",
-	}
-
-	port4 := coreV1.ServicePort{
-		Port: 8081,
-		Name: "random4",
-	}
-
-	ports1 := []coreV1.ServicePort{port3, port4}
-	service1.Spec.Ports = ports1
-
-	selectorMap4 := make(map[string]string)
-	selectorMap4["app"] = "test"
-	service4 := &coreV1.Service{
-		Spec: coreV1.ServiceSpec{
-			Selector: selectorMap4,
-		},
-	}
-	service4.Name = "dummy"
-	service4.Namespace = "namespace4"
-	port11 := coreV1.ServicePort{
-		Port: 8080,
-		Name: "random3",
-	}
-
-	port12 := coreV1.ServicePort{
-		Port: 8081,
-		Name: "random4",
-	}
-
-	ports11 := []coreV1.ServicePort{port11, port12}
-	service4.Spec.Ports = ports11
 
 	rcTemp.ServiceController.Cache.Put(service)
 	rcTemp.ServiceController.Cache.Put(service1)
+	rcTemp.ServiceController.Cache.Put(service3)
 	rcTemp.ServiceController.Cache.Put(service4)
+	rcTemp.ServiceController.Cache.Put(service5)
 	rcTemp.ServiceController.Cache.Put(stableService)
 	rcTemp.ServiceController.Cache.Put(canaryService)
+	rcTemp.ServiceController.Cache.Put(generatedStableService)
+	rcTemp.ServiceController.Cache.Put(rootService)
 
 	virtualService := &v1alpha32.VirtualService{
-		ObjectMeta: v12.ObjectMeta{Name: VS_NAME_1, Namespace: NAMESPACE},
+		ObjectMeta: metaV1.ObjectMeta{Name: vsName1, Namespace: Namespace},
 		Spec: v1alpha3.VirtualService{
 			Http: []*v1alpha3.HTTPRoute{{Route: []*v1alpha3.HTTPRouteDestination{
-				{Destination: &v1alpha3.Destination{Host: STABLESERVICENAME}, Weight: 80},
-				{Destination: &v1alpha3.Destination{Host: CANARYSERVICENAME}, Weight: 20},
+				{Destination: &v1alpha3.Destination{Host: StableServiceName}, Weight: 80},
+				{Destination: &v1alpha3.Destination{Host: CanaryServiceName}, Weight: 20},
 			}}},
 		},
 	}
 
 	vsMutipleRoutesWithMatch := &v1alpha32.VirtualService{
-		ObjectMeta: v12.ObjectMeta{Name: VS_NAME_2, Namespace: NAMESPACE},
+		ObjectMeta: metaV1.ObjectMeta{Name: vsName2, Namespace: Namespace},
 		Spec: v1alpha3.VirtualService{
-			Http: []*v1alpha3.HTTPRoute{{Name: VS_ROUTE_PRIMARY, Route: []*v1alpha3.HTTPRouteDestination{
-				{Destination: &v1alpha3.Destination{Host: STABLESERVICENAME}, Weight: 80},
-				{Destination: &v1alpha3.Destination{Host: CANARYSERVICENAME}, Weight: 20},
+			Http: []*v1alpha3.HTTPRoute{{Name: vsRoutePrimary, Route: []*v1alpha3.HTTPRouteDestination{
+				{Destination: &v1alpha3.Destination{Host: StableServiceName}, Weight: 80},
+				{Destination: &v1alpha3.Destination{Host: CanaryServiceName}, Weight: 20},
 			}}},
 		},
 	}
 
 	vsMutipleRoutesWithZeroWeight := &v1alpha32.VirtualService{
-		ObjectMeta: v12.ObjectMeta{Name: VS_NAME_4, Namespace: NAMESPACE},
+		ObjectMeta: metaV1.ObjectMeta{Name: vsName4, Namespace: Namespace},
 		Spec: v1alpha3.VirtualService{
 			Http: []*v1alpha3.HTTPRoute{{Name: "random", Route: []*v1alpha3.HTTPRouteDestination{
-				{Destination: &v1alpha3.Destination{Host: STABLESERVICENAME}, Weight: 100},
-				{Destination: &v1alpha3.Destination{Host: CANARYSERVICENAME}, Weight: 0},
+				{Destination: &v1alpha3.Destination{Host: StableServiceName}, Weight: 100},
+				{Destination: &v1alpha3.Destination{Host: CanaryServiceName}, Weight: 0},
 			}}},
 		},
 	}
-
-	rcTemp.VirtualServiceController.IstioClient.NetworkingV1alpha3().VirtualServices(NAMESPACE).Create(virtualService)
-	rcTemp.VirtualServiceController.IstioClient.NetworkingV1alpha3().VirtualServices(NAMESPACE).Create(vsMutipleRoutesWithMatch)
-	rcTemp.VirtualServiceController.IstioClient.NetworkingV1alpha3().VirtualServices(NAMESPACE).Create(vsMutipleRoutesWithZeroWeight)
+	ctx := context.Background()
+	rcTemp.VirtualServiceController.IstioClient.NetworkingV1alpha3().VirtualServices(Namespace).Create(ctx, virtualService, metaV1.CreateOptions{})
+	rcTemp.VirtualServiceController.IstioClient.NetworkingV1alpha3().VirtualServices(Namespace).Create(ctx, vsMutipleRoutesWithMatch, metaV1.CreateOptions{})
+	rcTemp.VirtualServiceController.IstioClient.NetworkingV1alpha3().VirtualServices(Namespace).Create(ctx, vsMutipleRoutesWithZeroWeight, metaV1.CreateOptions{})
 
 	canaryRollout := argo.Rollout{
 		Spec: argo.RolloutSpec{Template: coreV1.PodTemplateSpec{
-			ObjectMeta: k8sv1.ObjectMeta{Annotations: map[string]string{}},
+			ObjectMeta: metaV1.ObjectMeta{Annotations: map[string]string{}},
 		}}}
 	matchLabel := make(map[string]string)
 	matchLabel["app"] = "test"
 
-	labelSelector := v12.LabelSelector{
+	labelSelector := metaV1.LabelSelector{
 		MatchLabels: matchLabel,
 	}
 	canaryRollout.Spec.Selector = &labelSelector
 
-	canaryRollout.Namespace = NAMESPACE
+	canaryRollout.Namespace = Namespace
 	canaryRollout.Spec.Strategy = argo.RolloutStrategy{
 		Canary: &argo.CanaryStrategy{},
 	}
 
 	canaryRolloutNS1 := argo.Rollout{
 		Spec: argo.RolloutSpec{Template: coreV1.PodTemplateSpec{
-			ObjectMeta: k8sv1.ObjectMeta{Annotations: map[string]string{}},
+			ObjectMeta: metaV1.ObjectMeta{Annotations: map[string]string{}},
 		}}}
 	matchLabel2 := make(map[string]string)
 	matchLabel2["app"] = "test1"
 
-	labelSelector2 := v12.LabelSelector{
+	labelSelector2 := metaV1.LabelSelector{
 		MatchLabels: matchLabel2,
 	}
 	canaryRolloutNS1.Spec.Selector = &labelSelector2
@@ -638,40 +345,33 @@ func TestGetServiceForRolloutCanary(t *testing.T) {
 
 	canaryRolloutNS4 := argo.Rollout{
 		Spec: argo.RolloutSpec{Template: coreV1.PodTemplateSpec{
-			ObjectMeta: k8sv1.ObjectMeta{Annotations: map[string]string{}},
+			ObjectMeta: metaV1.ObjectMeta{Annotations: map[string]string{common.SidecarEnabledPorts: "8080"}},
 		}}}
 	matchLabel4 := make(map[string]string)
 	matchLabel4["app"] = "test"
-
-	labelSelector4 := v12.LabelSelector{
+	labelSelector4 := metaV1.LabelSelector{
 		MatchLabels: matchLabel4,
 	}
 	canaryRolloutNS4.Spec.Selector = &labelSelector4
-
 	canaryRolloutNS4.Namespace = "namespace4"
 	canaryRolloutNS4.Spec.Strategy = argo.RolloutStrategy{
 		Canary: &argo.CanaryStrategy{},
 	}
 
-	anotationsNS4Map := make(map[string]string)
-	anotationsNS4Map[common.SidecarEnabledPorts] = "8080"
-
-	canaryRolloutNS4.Spec.Template.Annotations = anotationsNS4Map
-
 	canaryRolloutIstioVs := argo.Rollout{
 		Spec: argo.RolloutSpec{Template: coreV1.PodTemplateSpec{
-			ObjectMeta: k8sv1.ObjectMeta{Annotations: map[string]string{}},
+			ObjectMeta: metaV1.ObjectMeta{Annotations: map[string]string{}},
 		}}}
 	canaryRolloutIstioVs.Spec.Selector = &labelSelector
 
-	canaryRolloutIstioVs.Namespace = NAMESPACE
+	canaryRolloutIstioVs.Namespace = Namespace
 	canaryRolloutIstioVs.Spec.Strategy = argo.RolloutStrategy{
 		Canary: &argo.CanaryStrategy{
-			StableService: STABLESERVICENAME,
-			CanaryService: CANARYSERVICENAME,
+			StableService: StableServiceName,
+			CanaryService: CanaryServiceName,
 			TrafficRouting: &argo.RolloutTrafficRouting{
 				Istio: &argo.IstioTrafficRouting{
-					VirtualService: argo.IstioVirtualService{Name: VS_NAME_1},
+					VirtualService: &argo.IstioVirtualService{Name: vsName1},
 				},
 			},
 		},
@@ -679,18 +379,18 @@ func TestGetServiceForRolloutCanary(t *testing.T) {
 
 	canaryRolloutIstioVsRouteMatch := argo.Rollout{
 		Spec: argo.RolloutSpec{Template: coreV1.PodTemplateSpec{
-			ObjectMeta: k8sv1.ObjectMeta{Annotations: map[string]string{}},
+			ObjectMeta: metaV1.ObjectMeta{Annotations: map[string]string{}},
 		}}}
 	canaryRolloutIstioVsRouteMatch.Spec.Selector = &labelSelector
 
-	canaryRolloutIstioVsRouteMatch.Namespace = NAMESPACE
+	canaryRolloutIstioVsRouteMatch.Namespace = Namespace
 	canaryRolloutIstioVsRouteMatch.Spec.Strategy = argo.RolloutStrategy{
 		Canary: &argo.CanaryStrategy{
-			StableService: STABLESERVICENAME,
-			CanaryService: CANARYSERVICENAME,
+			StableService: StableServiceName,
+			CanaryService: CanaryServiceName,
 			TrafficRouting: &argo.RolloutTrafficRouting{
 				Istio: &argo.IstioTrafficRouting{
-					VirtualService: argo.IstioVirtualService{Name: VS_NAME_2, Routes: []string{VS_ROUTE_PRIMARY}},
+					VirtualService: &argo.IstioVirtualService{Name: vsName2, Routes: []string{vsRoutePrimary}},
 				},
 			},
 		},
@@ -698,18 +398,18 @@ func TestGetServiceForRolloutCanary(t *testing.T) {
 
 	canaryRolloutIstioVsRouteMisMatch := argo.Rollout{
 		Spec: argo.RolloutSpec{Template: coreV1.PodTemplateSpec{
-			ObjectMeta: k8sv1.ObjectMeta{Annotations: map[string]string{}},
+			ObjectMeta: metaV1.ObjectMeta{Annotations: map[string]string{}},
 		}}}
 	canaryRolloutIstioVsRouteMisMatch.Spec.Selector = &labelSelector
 
-	canaryRolloutIstioVsRouteMisMatch.Namespace = NAMESPACE
+	canaryRolloutIstioVsRouteMisMatch.Namespace = Namespace
 	canaryRolloutIstioVsRouteMisMatch.Spec.Strategy = argo.RolloutStrategy{
 		Canary: &argo.CanaryStrategy{
-			StableService: STABLESERVICENAME,
-			CanaryService: CANARYSERVICENAME,
+			StableService: StableServiceName,
+			CanaryService: CanaryServiceName,
 			TrafficRouting: &argo.RolloutTrafficRouting{
 				Istio: &argo.IstioTrafficRouting{
-					VirtualService: argo.IstioVirtualService{Name: VS_NAME_3, Routes: []string{"random"}},
+					VirtualService: &argo.IstioVirtualService{Name: vsName2, Routes: []string{"random"}},
 				},
 			},
 		},
@@ -717,52 +417,132 @@ func TestGetServiceForRolloutCanary(t *testing.T) {
 
 	canaryRolloutIstioVsZeroWeight := argo.Rollout{
 		Spec: argo.RolloutSpec{Template: coreV1.PodTemplateSpec{
-			ObjectMeta: k8sv1.ObjectMeta{Annotations: map[string]string{}},
+			ObjectMeta: metaV1.ObjectMeta{Annotations: map[string]string{}},
 		}}}
 	canaryRolloutIstioVsZeroWeight.Spec.Selector = &labelSelector
 
-	canaryRolloutIstioVsZeroWeight.Namespace = NAMESPACE
+	canaryRolloutIstioVsZeroWeight.Namespace = Namespace
 	canaryRolloutIstioVsZeroWeight.Spec.Strategy = argo.RolloutStrategy{
 		Canary: &argo.CanaryStrategy{
-			StableService: STABLESERVICENAME,
-			CanaryService: CANARYSERVICENAME,
+			StableService: StableServiceName,
+			CanaryService: CanaryServiceName,
 			TrafficRouting: &argo.RolloutTrafficRouting{
 				Istio: &argo.IstioTrafficRouting{
-					VirtualService: argo.IstioVirtualService{Name: VS_NAME_4},
+					VirtualService: &argo.IstioVirtualService{Name: vsName4},
 				},
 			},
 		},
 	}
 
-	canaryRolloutIstioVsMimatch := argo.Rollout{
+	canaryRolloutWithRootService := argo.Rollout{
 		Spec: argo.RolloutSpec{Template: coreV1.PodTemplateSpec{
-			ObjectMeta: k8sv1.ObjectMeta{Annotations: map[string]string{}},
+			ObjectMeta: metaV1.ObjectMeta{Annotations: map[string]string{}},
 		}}}
-	canaryRolloutIstioVsMimatch.Spec.Selector = &labelSelector
+	canaryRolloutWithRootService.Spec.Selector = &labelSelector
 
-	canaryRolloutIstioVsMimatch.Namespace = NAMESPACE
-	canaryRolloutIstioVsMimatch.Spec.Strategy = argo.RolloutStrategy{
+	canaryRolloutWithRootService.Namespace = Namespace
+	canaryRolloutWithRootService.Spec.Strategy = argo.RolloutStrategy{
 		Canary: &argo.CanaryStrategy{
-			StableService: STABLESERVICENAME,
-			CanaryService: CANARYSERVICENAME,
-			TrafficRouting: &argo.RolloutTrafficRouting{
-				Istio: &argo.IstioTrafficRouting{
-					VirtualService: argo.IstioVirtualService{Name: "random"},
+			StableService: StableServiceName,
+			CanaryService: CanaryServiceName,
+		},
+	}
+
+	canaryRolloutWithoutRootService := argo.Rollout{
+		Spec: argo.RolloutSpec{Template: coreV1.PodTemplateSpec{
+			ObjectMeta: metaV1.ObjectMeta{Annotations: map[string]string{}},
+		}}}
+	matchLabel5 := make(map[string]string)
+	matchLabel5["app"] = "test5"
+
+	labelSelector5 := metaV1.LabelSelector{
+		MatchLabels: matchLabel5,
+	}
+	canaryRolloutWithoutRootService.Spec.Selector = &labelSelector5
+
+	canaryRolloutWithoutRootService.Namespace = "namespace5"
+	canaryRolloutWithoutRootService.Spec.Strategy = argo.RolloutStrategy{
+		Canary: &argo.CanaryStrategy{},
+	}
+
+	canaryRolloutNoStrategy := argo.Rollout{
+		Spec: argo.RolloutSpec{Template: coreV1.PodTemplateSpec{
+			ObjectMeta: metaV1.ObjectMeta{Annotations: map[string]string{}},
+		}}}
+	matchLabel6 := make(map[string]string)
+	matchLabel6["app"] = "test6"
+
+	labelSelector6 := metaV1.LabelSelector{
+		MatchLabels: matchLabel6,
+	}
+	canaryRolloutNoStrategy.Spec.Selector = &labelSelector6
+
+	canaryRolloutNoStrategy.Namespace = "namespace6"
+
+	canaryRolloutWithoutIstioVS := argo.Rollout{
+		ObjectMeta: metaV1.ObjectMeta{Namespace: Namespace},
+		Spec: argo.RolloutSpec{
+			Selector: &labelSelector,
+			Strategy: argo.RolloutStrategy{
+				Canary: &argo.CanaryStrategy{
+					StableService: StableServiceName,
+					CanaryService: CanaryServiceName,
+					TrafficRouting: &argo.RolloutTrafficRouting{
+						Istio: &argo.IstioTrafficRouting{},
+					},
 				},
 			},
 		},
 	}
 
-	resultForDummy := map[string]*WeightedService{"dummy": {Weight: 1, Service: service1}}
+	canaryRolloutIstioVsMismatch := argo.Rollout{
+		ObjectMeta: metaV1.ObjectMeta{Namespace: Namespace},
+		Spec: argo.RolloutSpec{
+			Selector: &labelSelector,
+			Strategy: argo.RolloutStrategy{
+				Canary: &argo.CanaryStrategy{
+					StableService: StableServiceName,
+					CanaryService: CanaryServiceName,
+					TrafficRouting: &argo.RolloutTrafficRouting{
+						Istio: &argo.IstioTrafficRouting{
+							VirtualService: &argo.IstioVirtualService{Name: "random"},
+						},
+					},
+				},
+			},
+		},
+	}
 
-	resultForRandomMatch := map[string]*WeightedService{CANARYSERVICENAME: {Weight: 1, Service: canaryService}}
+	canaryRolloutWithStableServiceNS4 := argo.Rollout{
+		Spec: argo.RolloutSpec{Template: coreV1.PodTemplateSpec{
+			ObjectMeta: metaV1.ObjectMeta{Annotations: map[string]string{common.SidecarEnabledPorts: "8080"}},
+		}}}
+	canaryRolloutWithStableServiceNS4.Spec.Selector = &labelSelector
 
-	resultForStableServiceOnly := map[string]*WeightedService{STABLESERVICENAME: {Weight: 1, Service: stableService}}
+	canaryRolloutWithStableServiceNS4.Namespace = "namespace4"
+	canaryRolloutWithStableServiceNS4.Spec.Strategy = argo.RolloutStrategy{
+		Canary: &argo.CanaryStrategy{
+			StableService: StableServiceName,
+			CanaryService: CanaryServiceName,
+		},
+	}
 
-	resultForCanaryWithIstio := map[string]*WeightedService{STABLESERVICENAME: {Weight: 80, Service: stableService},
-		CANARYSERVICENAME: {Weight: 20, Service: canaryService}}
+	resultForDummy := map[string]*WeightedService{service3.Name: {Weight: 1, Service: service3}}
 
-	resultForCanaryWithStableService := map[string]*WeightedService{STABLESERVICENAME: {Weight: 100, Service: stableService}}
+	resultForEmptyStableServiceOnRollout := map[string]*WeightedService{RootService: {Weight: 1, Service: rootService}}
+
+	resultForCanaryWithIstio := map[string]*WeightedService{StableServiceName: {Weight: 80, Service: stableService},
+		CanaryServiceName: {Weight: 20, Service: canaryService}}
+
+	resultForCanaryWithRootService := map[string]*WeightedService{RootService: {Weight: 1, Service: rootService}}
+
+	resultForCanaryWithStableService := map[string]*WeightedService{StableServiceName: {Weight: 1, Service: stableService}}
+
+	resultForCanaryWithoutRootService := map[string]*WeightedService{GeneratedStableServiceName: {Weight: 1, Service: service5}}
+
+	resultForCanaryWithStableServiceWeight := map[string]*WeightedService{StableServiceName: {Weight: 100, Service: stableService}}
+
+	resultRolloutWithOneServiceHavingMeshPort := map[string]*WeightedService{service3.Name: {Weight: 1, Service: service3}}
 
 	testCases := []struct {
 		name    string
@@ -784,12 +564,17 @@ func TestGetServiceForRolloutCanary(t *testing.T) {
 			name:    "canaryRolloutHappyCase",
 			rollout: &canaryRollout,
 			rc:      rcTemp,
-			result:  resultForRandomMatch,
+			result:  resultForEmptyStableServiceOnRollout,
 		}, {
-			name:    "canaryRolloutWithStableService",
-			rollout: &canaryRolloutIstioVsMimatch,
+			name:    "canaryRolloutWithoutIstioVS",
+			rollout: &canaryRolloutWithoutIstioVS,
 			rc:      rcTemp,
-			result:  resultForStableServiceOnly,
+			result:  resultForCanaryWithStableService,
+		}, {
+			name:    "canaryRolloutWithIstioVsMimatch",
+			rollout: &canaryRolloutIstioVsMismatch,
+			rc:      rcTemp,
+			result:  resultForCanaryWithStableService,
 		}, {
 			name:    "canaryRolloutWithIstioVirtualService",
 			rollout: &canaryRolloutIstioVs,
@@ -799,7 +584,7 @@ func TestGetServiceForRolloutCanary(t *testing.T) {
 			name:    "canaryRolloutWithIstioVirtualServiceZeroWeight",
 			rollout: &canaryRolloutIstioVsZeroWeight,
 			rc:      rcTemp,
-			result:  resultForCanaryWithStableService,
+			result:  resultForCanaryWithStableServiceWeight,
 		}, {
 			name:    "canaryRolloutWithIstioRouteMatch",
 			rollout: &canaryRolloutIstioVsRouteMatch,
@@ -809,16 +594,40 @@ func TestGetServiceForRolloutCanary(t *testing.T) {
 			name:    "canaryRolloutWithIstioRouteMisMatch",
 			rollout: &canaryRolloutIstioVsRouteMisMatch,
 			rc:      rcTemp,
-			result:  resultForStableServiceOnly,
+			result:  resultForCanaryWithStableService,
+		},
+		{
+			name:    "canaryRolloutWithRootServiceName",
+			rollout: &canaryRolloutWithRootService,
+			rc:      rcTemp,
+			result:  resultForCanaryWithRootService,
+		},
+		{
+			name:    "canaryRolloutWithOneServiceHavingMeshPort",
+			rollout: &canaryRolloutWithStableServiceNS4,
+			rc:      rcTemp,
+			result:  resultRolloutWithOneServiceHavingMeshPort,
+		},
+		{
+			name:    "canaryRolloutWithRootServiceNameMissing",
+			rollout: &canaryRolloutWithoutRootService,
+			rc:      rcTemp,
+			result:  resultForCanaryWithoutRootService,
+		},
+		{
+			name:    "canaryRolloutEmptyStrategy",
+			rollout: &canaryRolloutNoStrategy,
+			rc:      rcTemp,
+			result:  nil,
 		},
 	}
 
 	//Run the test for every provided case
 	for _, c := range testCases {
 		t.Run(c.name, func(t *testing.T) {
-			result := getServiceForRollout(c.rc, c.rollout)
+			result := getServiceForRollout(ctx, c.rc, c.rollout)
 			if len(c.result) == 0 {
-				if result != nil && len(result) != 0 {
+				if len(result) != 0 {
 					t.Fatalf("Service expected to be nil")
 				}
 			} else {
@@ -841,61 +650,89 @@ func TestGetServiceForRolloutCanary(t *testing.T) {
 
 func TestGetServiceForRolloutBlueGreen(t *testing.T) {
 	//Struct of test case info. Name is required.
-	const NAMESPACE = "namespace"
-	const SERVICENAME = "serviceNameActive"
-	const ROLLOUT_POD_HASH_LABEL string = "rollouts-pod-template-hash"
+	const (
+		namespace   = "namespace"
+		serviceName = "serviceNameActive"
 
-	config := rest.Config{
-		Host: "localhost",
+		generatedActiveServiceName        = "hello-" + common.RolloutActiveServiceSuffix
+		rolloutPodHashLabel        string = "rollouts-pod-template-hash"
+	)
+	var (
+		stop   = make(chan struct{})
+		config = rest.Config{
+			Host: "localhost",
+		}
+		matchLabel = map[string]string{
+			"app": "test",
+		}
+		labelSelector = metaV1.LabelSelector{
+			MatchLabels: matchLabel,
+		}
+		bgRollout = argo.Rollout{
+			Spec: argo.RolloutSpec{
+				Selector: &labelSelector,
+				Strategy: argo.RolloutStrategy{
+					BlueGreen: &argo.BlueGreenStrategy{
+						ActiveService:  serviceName,
+						PreviewService: "previewService",
+					},
+				},
+				Template: coreV1.PodTemplateSpec{
+					ObjectMeta: metaV1.ObjectMeta{Annotations: map[string]string{}},
+				},
+			},
+			ObjectMeta: metaV1.ObjectMeta{
+				Namespace: namespace,
+			},
+		}
+		bgRolloutNoActiveService = argo.Rollout{
+			Spec: argo.RolloutSpec{
+				Selector: &labelSelector,
+				Strategy: argo.RolloutStrategy{
+					BlueGreen: &argo.BlueGreenStrategy{},
+				},
+				Template: coreV1.PodTemplateSpec{
+					ObjectMeta: metaV1.ObjectMeta{Annotations: map[string]string{}},
+				},
+			},
+			ObjectMeta: metaV1.ObjectMeta{
+				Namespace: namespace,
+			},
+		}
+		selectorMap = map[string]string{
+			"app":               "test",
+			rolloutPodHashLabel: "hash",
+		}
+		activeService = &coreV1.Service{
+			Spec: coreV1.ServiceSpec{
+				Selector: selectorMap,
+			},
+			ObjectMeta: metaV1.ObjectMeta{
+				Name:      serviceName,
+				Namespace: namespace,
+			},
+		}
+	)
+	s, err := admiral.NewServiceController(stop, &test.MockServiceHandler{}, &config, time.Second*time.Duration(300), loader.GetFakeClientLoader())
+	if err != nil {
+		t.Fatalf("failed to initialize service controller, err: %v", err)
 	}
-	stop := make(chan struct{})
+	r, err := admiral.NewRolloutsController(stop, &test.MockRolloutHandler{}, &config, time.Second*time.Duration(300), loader.GetFakeClientLoader())
+	if err != nil {
+		t.Fatalf("failed to initialize rollout controller, err: %v", err)
+	}
 
-	s, e := admiral.NewServiceController(stop, &test.MockServiceHandler{}, &config, time.Second*time.Duration(300))
-	r, e := admiral.NewRolloutsController(stop, &test.MockRolloutHandler{}, &config, time.Second*time.Duration(300))
-
-	emptyCacheService, e := admiral.NewServiceController(stop, &test.MockServiceHandler{}, &config, time.Second*time.Duration(300))
-
-	if e != nil {
-		t.Fatalf("Inititalization failed")
+	emptyCacheService, err := admiral.NewServiceController(stop, &test.MockServiceHandler{}, &config, time.Second*time.Duration(300), loader.GetFakeClientLoader())
+	if err != nil {
+		t.Fatalf("failed to initialize empty service controller, err: %v", err)
 	}
 
 	rc := &RemoteController{
 		VirtualServiceController: &istio.VirtualServiceController{},
 		ServiceController:        s,
-		RolloutController:        r}
-
-	bgRollout := argo.Rollout{
-		Spec: argo.RolloutSpec{Template: coreV1.PodTemplateSpec{
-			ObjectMeta: k8sv1.ObjectMeta{Annotations: map[string]string{}},
-		}}}
-
-	matchLabel := make(map[string]string)
-	matchLabel["app"] = "test"
-
-	labelSelector := v12.LabelSelector{
-		MatchLabels: matchLabel,
-	}
-	bgRollout.Spec.Selector = &labelSelector
-
-	bgRollout.Namespace = NAMESPACE
-	bgRollout.Spec.Strategy = argo.RolloutStrategy{
-		BlueGreen: &argo.BlueGreenStrategy{
-			ActiveService:  SERVICENAME,
-			PreviewService: "previewService",
-		},
+		RolloutController:        r,
 	}
 
-	selectorMap := make(map[string]string)
-	selectorMap["app"] = "test"
-	selectorMap[ROLLOUT_POD_HASH_LABEL] = "hash"
-
-	activeService := &coreV1.Service{
-		Spec: coreV1.ServiceSpec{
-			Selector: selectorMap,
-		},
-	}
-	activeService.Name = SERVICENAME
-	activeService.Namespace = NAMESPACE
 	port1 := coreV1.ServicePort{
 		Port: 8080,
 		Name: "random1",
@@ -909,6 +746,15 @@ func TestGetServiceForRolloutBlueGreen(t *testing.T) {
 	ports := []coreV1.ServicePort{port1, port2}
 	activeService.Spec.Ports = ports
 
+	generatedActiveService := &coreV1.Service{
+		Spec: coreV1.ServiceSpec{
+			Selector: selectorMap,
+		},
+	}
+	generatedActiveService.Name = generatedActiveServiceName
+	generatedActiveService.Namespace = namespace
+	generatedActiveService.Spec.Ports = ports
+
 	selectorMap1 := make(map[string]string)
 	selectorMap1["app"] = "test1"
 
@@ -918,7 +764,7 @@ func TestGetServiceForRolloutBlueGreen(t *testing.T) {
 		},
 	}
 	service1.Name = "dummy"
-	service1.Namespace = NAMESPACE
+	service1.Namespace = namespace
 	port3 := coreV1.ServicePort{
 		Port: 8080,
 		Name: "random3",
@@ -934,14 +780,14 @@ func TestGetServiceForRolloutBlueGreen(t *testing.T) {
 
 	selectorMap2 := make(map[string]string)
 	selectorMap2["app"] = "test"
-	selectorMap2[ROLLOUT_POD_HASH_LABEL] = "hash"
+	selectorMap2[rolloutPodHashLabel] = "hash"
 	previewService := &coreV1.Service{
 		Spec: coreV1.ServiceSpec{
 			Selector: selectorMap,
 		},
 	}
 	previewService.Name = "previewService"
-	previewService.Namespace = NAMESPACE
+	previewService.Namespace = namespace
 	port5 := coreV1.ServicePort{
 		Port: 8080,
 		Name: "random3",
@@ -980,24 +826,25 @@ func TestGetServiceForRolloutBlueGreen(t *testing.T) {
 	rc.ServiceController.Cache.Put(previewService)
 	rc.ServiceController.Cache.Put(activeService)
 	rc.ServiceController.Cache.Put(serviceNS1)
+	rc.ServiceController.Cache.Put(generatedActiveService)
 
 	noStratergyRollout := argo.Rollout{
 		Spec: argo.RolloutSpec{Template: coreV1.PodTemplateSpec{
-			ObjectMeta: k8sv1.ObjectMeta{Annotations: map[string]string{}},
+			ObjectMeta: metaV1.ObjectMeta{Annotations: map[string]string{}},
 		}}}
-	noStratergyRollout.Namespace = NAMESPACE
+	noStratergyRollout.Namespace = namespace
 
 	noStratergyRollout.Spec.Strategy = argo.RolloutStrategy{}
 
 	bgRolloutNs1 := argo.Rollout{
 		Spec: argo.RolloutSpec{Template: coreV1.PodTemplateSpec{
-			ObjectMeta: k8sv1.ObjectMeta{Annotations: map[string]string{}},
+			ObjectMeta: metaV1.ObjectMeta{Annotations: map[string]string{}},
 		}}}
 
 	matchLabel1 := make(map[string]string)
 	matchLabel1["app"] = "test"
 
-	labelSelector1 := v12.LabelSelector{
+	labelSelector1 := metaV1.LabelSelector{
 		MatchLabels: matchLabel,
 	}
 	bgRolloutNs1.Spec.Selector = &labelSelector1
@@ -1005,12 +852,13 @@ func TestGetServiceForRolloutBlueGreen(t *testing.T) {
 	bgRolloutNs1.Namespace = "namespace1"
 	bgRolloutNs1.Spec.Strategy = argo.RolloutStrategy{
 		BlueGreen: &argo.BlueGreenStrategy{
-			ActiveService:  SERVICENAME,
+			ActiveService:  serviceName,
 			PreviewService: "previewService",
 		},
 	}
 
-	resultForBlueGreen := map[string]*WeightedService{SERVICENAME: {Weight: 1, Service: activeService}}
+	resultForBlueGreen := map[string]*WeightedService{serviceName: {Weight: 1, Service: activeService}}
+	resultForNoActiveService := map[string]*WeightedService{generatedActiveServiceName: {Weight: 1, Service: generatedActiveService}}
 
 	testCases := []struct {
 		name    string
@@ -1033,6 +881,11 @@ func TestGetServiceForRolloutBlueGreen(t *testing.T) {
 			rollout: &bgRollout,
 			rc:      rc,
 			result:  resultForBlueGreen,
+		}, {
+			name:    "rolloutWithNoActiveService",
+			rollout: &bgRolloutNoActiveService,
+			rc:      rc,
+			result:  resultForNoActiveService,
 		},
 		{
 			name:    "canaryRolloutNilRollout",
@@ -1050,12 +903,14 @@ func TestGetServiceForRolloutBlueGreen(t *testing.T) {
 		},
 	}
 
+	ctx := context.Background()
+
 	//Run the test for every provided case
 	for _, c := range testCases {
 		t.Run(c.name, func(t *testing.T) {
-			result := getServiceForRollout(c.rc, c.rollout)
+			result := getServiceForRollout(ctx, c.rc, c.rollout)
 			if len(c.result) == 0 {
-				if result != nil && len(result) > 0 {
+				if len(result) > 0 {
 					t.Fatalf("Service expected to be nil")
 				}
 			} else {
@@ -1073,259 +928,24 @@ func TestGetServiceForRolloutBlueGreen(t *testing.T) {
 	}
 }
 
-func TestSkipDestructiveUpdate(t *testing.T) {
-
-	twoEndpointSe := v1alpha3.ServiceEntry{
-		Hosts:     []string{"e2e.my-first-service.mesh"},
-		Addresses: []string{"240.10.1.1"},
-		Ports: []*v1alpha3.Port{{Number: uint32(common.DefaultServiceEntryPort),
-			Name: "http", Protocol: "http"}},
-		Location:        v1alpha3.ServiceEntry_MESH_INTERNAL,
-		Resolution:      v1alpha3.ServiceEntry_DNS,
-		SubjectAltNames: []string{"spiffe://prefix/my-first-service"},
-		Endpoints: []*v1alpha3.ServiceEntry_Endpoint{
-			{Address: "dummy.admiral.global-west", Ports: map[string]uint32{"http": 0}, Locality: "us-west-2"},
-			{Address: "dummy.admiral.global-east", Ports: map[string]uint32{"http": 0}, Locality: "us-east-2"},
-		},
+func makeRemoteRegistry(
+	clusterNames []string, remoteController *RemoteController, cname string, dependentClusters []string) *RemoteRegistry {
+	var (
+		cache = common.NewMapOfMaps()
+		rr    = NewRemoteRegistry(context.TODO(), common.AdmiralParams{})
+	)
+	rr.AdmiralCache = &AdmiralCache{
+		CnameDependentClusterCache: cache,
+	}
+	for _, dependentCluster := range dependentClusters {
+		rr.AdmiralCache.CnameDependentClusterCache.Put(cname, dependentCluster, dependentCluster)
+	}
+	for _, clusterName := range clusterNames {
+		rr.PutRemoteController(
+			clusterName,
+			remoteController,
+		)
 	}
 
-	twoEndpointSeUpdated := v1alpha3.ServiceEntry{
-		Hosts:     []string{"e2e.my-first-service.mesh"},
-		Addresses: []string{"240.10.1.1"},
-		Ports: []*v1alpha3.Port{{Number: uint32(common.DefaultServiceEntryPort),
-			Name: "http", Protocol: "http"}},
-		Location:        v1alpha3.ServiceEntry_MESH_INTERNAL,
-		Resolution:      v1alpha3.ServiceEntry_DNS,
-		SubjectAltNames: []string{"spiffe://prefix/my-first-service"},
-		Endpoints: []*v1alpha3.ServiceEntry_Endpoint{
-			{Address: "dummy.admiral.global-west", Ports: map[string]uint32{"http": 90}, Locality: "us-west-2"},
-			{Address: "dummy.admiral.global-east", Ports: map[string]uint32{"http": 0}, Locality: "us-east-2"},
-		},
-	}
-
-	oneEndpointSe := v1alpha3.ServiceEntry{
-		Hosts:     []string{"e2e.my-first-service.mesh"},
-		Addresses: []string{"240.10.1.1"},
-		Ports: []*v1alpha3.Port{{Number: uint32(common.DefaultServiceEntryPort),
-			Name: "http", Protocol: "http"}},
-		Location:        v1alpha3.ServiceEntry_MESH_INTERNAL,
-		Resolution:      v1alpha3.ServiceEntry_DNS,
-		SubjectAltNames: []string{"spiffe://prefix/my-first-service"},
-		Endpoints: []*v1alpha3.ServiceEntry_Endpoint{
-			{Address: "dummy.admiral.global-west", Ports: map[string]uint32{"http": 0}, Locality: "us-west-2"},
-		},
-	}
-
-	newSeTwoEndpoints := &v1alpha32.ServiceEntry{
-		ObjectMeta: v12.ObjectMeta{Name: "se1", Namespace: "random"},
-		Spec:       twoEndpointSe,
-	}
-
-	newSeTwoEndpointsUpdated := &v1alpha32.ServiceEntry{
-		ObjectMeta: v12.ObjectMeta{Name: "se1", Namespace: "random"},
-		Spec:       twoEndpointSeUpdated,
-	}
-
-	newSeOneEndpoint := &v1alpha32.ServiceEntry{
-		ObjectMeta: v12.ObjectMeta{Name: "se1", Namespace: "random"},
-		Spec:       oneEndpointSe,
-	}
-
-	oldSeTwoEndpoints := &v1alpha32.ServiceEntry{
-		ObjectMeta: v12.ObjectMeta{Name: "se1", Namespace: "random"},
-		Spec:       twoEndpointSe,
-	}
-
-	oldSeOneEndpoint := &v1alpha32.ServiceEntry{
-		ObjectMeta: v12.ObjectMeta{Name: "se1", Namespace: "random"},
-		Spec:       oneEndpointSe,
-	}
-
-	rcWarmupPhase := &RemoteController{
-		StartTime: time.Now(),
-	}
-
-	rcNotinWarmupPhase := &RemoteController{
-		StartTime: time.Now().Add(time.Duration(-21) * time.Minute),
-	}
-
-	//Struct of test case info. Name is required.
-	testCases := []struct {
-		name            string
-		rc              *RemoteController
-		newSe           *v1alpha32.ServiceEntry
-		oldSe           *v1alpha32.ServiceEntry
-		skipDestructive bool
-		diff            string
-	}{
-		{
-			name:            "Should return false when in warm up phase but not destructive",
-			rc:              rcWarmupPhase,
-			newSe:           newSeOneEndpoint,
-			oldSe:           oldSeOneEndpoint,
-			skipDestructive: false,
-			diff:            "",
-		},
-		{
-			name:            "Should return true when in warm up phase but is destructive",
-			rc:              rcWarmupPhase,
-			newSe:           newSeOneEndpoint,
-			oldSe:           oldSeTwoEndpoints,
-			skipDestructive: true,
-			diff:            "Delete",
-		},
-		{
-			name:            "Should return false when not in warm up phase but is destructive",
-			rc:              rcNotinWarmupPhase,
-			newSe:           newSeOneEndpoint,
-			oldSe:           oldSeTwoEndpoints,
-			skipDestructive: false,
-			diff:            "Delete",
-		},
-		{
-			name:            "Should return false when in warm up phase but is constructive",
-			rc:              rcWarmupPhase,
-			newSe:           newSeTwoEndpoints,
-			oldSe:           oldSeOneEndpoint,
-			skipDestructive: false,
-			diff:            "Add",
-		},
-		{
-			name:            "Should return false when not in warm up phase but endpoints updated",
-			rc:              rcNotinWarmupPhase,
-			newSe:           newSeTwoEndpointsUpdated,
-			oldSe:           oldSeTwoEndpoints,
-			skipDestructive: false,
-			diff:            "Update",
-		},
-		{
-			name:            "Should return true when in warm up phase but endpoints are updated (destructive)",
-			rc:              rcWarmupPhase,
-			newSe:           newSeTwoEndpointsUpdated,
-			oldSe:           oldSeTwoEndpoints,
-			skipDestructive: true,
-			diff:            "Update",
-		},
-	}
-
-	//Run the test for every provided case
-	for _, c := range testCases {
-		t.Run(c.name, func(t *testing.T) {
-			skipDestructive, diff := skipDestructiveUpdate(c.rc, c.newSe, c.oldSe)
-			if skipDestructive == c.skipDestructive {
-				//perfect
-			} else {
-				t.Errorf("Result Failed. Got %v, expected %v", skipDestructive, c.skipDestructive)
-			}
-			if c.diff == "" || (c.diff != "" && strings.Contains(diff, c.diff)) {
-				//perfect
-			} else {
-				t.Errorf("Diff Failed. Got %v, expected %v", diff, c.diff)
-			}
-		})
-	}
-}
-
-func TestAddUpdateServiceEntry(t *testing.T) {
-
-	fakeIstioClient := istiofake.NewSimpleClientset()
-
-	seCtrl := &istio.ServiceEntryController{
-		IstioClient: fakeIstioClient,
-	}
-
-	twoEndpointSe := v1alpha3.ServiceEntry{
-		Hosts:     []string{"e2e.my-first-service.mesh"},
-		Addresses: []string{"240.10.1.1"},
-		Ports: []*v1alpha3.Port{{Number: uint32(common.DefaultServiceEntryPort),
-			Name: "http", Protocol: "http"}},
-		Location:        v1alpha3.ServiceEntry_MESH_INTERNAL,
-		Resolution:      v1alpha3.ServiceEntry_DNS,
-		SubjectAltNames: []string{"spiffe://prefix/my-first-service"},
-		Endpoints: []*v1alpha3.ServiceEntry_Endpoint{
-			{Address: "dummy.admiral.global-west", Ports: map[string]uint32{"http": 0}, Locality: "us-west-2"},
-			{Address: "dummy.admiral.global-east", Ports: map[string]uint32{"http": 0}, Locality: "us-east-2"},
-		},
-	}
-
-	oneEndpointSe := v1alpha3.ServiceEntry{
-		Hosts:     []string{"e2e.my-first-service.mesh"},
-		Addresses: []string{"240.10.1.1"},
-		Ports: []*v1alpha3.Port{{Number: uint32(common.DefaultServiceEntryPort),
-			Name: "http", Protocol: "http"}},
-		Location:        v1alpha3.ServiceEntry_MESH_INTERNAL,
-		Resolution:      v1alpha3.ServiceEntry_DNS,
-		SubjectAltNames: []string{"spiffe://prefix/my-first-service"},
-		Endpoints: []*v1alpha3.ServiceEntry_Endpoint{
-			{Address: "dummy.admiral.global-west", Ports: map[string]uint32{"http": 0}, Locality: "us-west-2"},
-		},
-	}
-
-	newSeOneEndpoint := &v1alpha32.ServiceEntry{
-		ObjectMeta: v12.ObjectMeta{Name: "se1", Namespace: "namespace"},
-		Spec:       oneEndpointSe,
-	}
-
-	oldSeTwoEndpoints := &v1alpha32.ServiceEntry{
-		ObjectMeta: v12.ObjectMeta{Name: "se2", Namespace: "namespace"},
-		Spec:       twoEndpointSe,
-	}
-
-	seCtrl.IstioClient.NetworkingV1alpha3().ServiceEntries("namespace").Create(oldSeTwoEndpoints)
-
-	rcWarmupPhase := &RemoteController{
-		ServiceEntryController: seCtrl,
-		StartTime:              time.Now(),
-	}
-
-	rcNotinWarmupPhase := &RemoteController{
-		ServiceEntryController: seCtrl,
-		StartTime:              time.Now().Add(time.Duration(-21) * time.Minute),
-	}
-
-	//Struct of test case info. Name is required.
-	testCases := []struct {
-		name            string
-		rc              *RemoteController
-		newSe           *v1alpha32.ServiceEntry
-		oldSe           *v1alpha32.ServiceEntry
-		skipDestructive bool
-	}{
-		{
-			name:            "Should add a new SE",
-			rc:              rcWarmupPhase,
-			newSe:           newSeOneEndpoint,
-			oldSe:           nil,
-			skipDestructive: false,
-		},
-		{
-			name:            "Should not update SE when in warm up mode and the update is destructive",
-			rc:              rcWarmupPhase,
-			newSe:           newSeOneEndpoint,
-			oldSe:           oldSeTwoEndpoints,
-			skipDestructive: true,
-		},
-		{
-			name:            "Should update an SE",
-			rc:              rcNotinWarmupPhase,
-			newSe:           newSeOneEndpoint,
-			oldSe:           oldSeTwoEndpoints,
-			skipDestructive: false,
-		},
-	}
-
-	//Run the test for every provided case
-	for _, c := range testCases {
-		t.Run(c.name, func(t *testing.T) {
-			addUpdateServiceEntry(c.newSe, c.oldSe, "namespace", c.rc)
-			if c.skipDestructive {
-				//verify the update did not go through
-				se, _ := c.rc.ServiceEntryController.IstioClient.NetworkingV1alpha3().ServiceEntries("namespace").Get(c.oldSe.Name, v12.GetOptions{})
-				_, diff := getServiceEntryDiff(c.oldSe, se)
-				if diff != "" {
-					t.Errorf("Failed. Got %v, expected %v", se.Spec.String(), c.oldSe.Spec.String())
-				}
-			}
-		})
-	}
+	return rr
 }
